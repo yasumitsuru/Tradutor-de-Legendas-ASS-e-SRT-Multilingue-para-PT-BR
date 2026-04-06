@@ -27,6 +27,7 @@ web_config.json
 # Local tooling folders
 .claude/
 .qwen/
+contexto CODEX/
 
 # Secrets
 .env
