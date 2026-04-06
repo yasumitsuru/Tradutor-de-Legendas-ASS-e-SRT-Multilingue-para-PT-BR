@@ -1,0 +1,510 @@
+﻿<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tradutor ASS Web</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="page">
+    <section class="panel">
+      <h1>Tradutor de arquivos .ass do Inglês para o Português Brasil by Yasu</h1>
+
+      <form id="translation-form" class="form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="input_dir" value="{{ defaults.input_dir }}">
+
+        <div class="upload-box">
+          <label>
+            Arquivos .ass (múltiplos)
+            <input type="file" id="ass-files" name="ass_files" accept=".ass" multiple>
+          </label>
+          <button id="upload-btn" type="button">Upload dos Arquivos</button>
+          <p id="upload-meta" class="meta small">Nenhum upload feito.</p>
+          <div class="file-list-box">
+            <p class="file-list-title">Arquivos de Entrada (.ass)</p>
+            <ul id="input-files-list" class="file-list">
+              <li class="empty-item">Nenhum arquivo encontrado.</li>
+            </ul>
+          </div>
+        </div>
+
+        <input type="hidden" name="output_dir" value="{{ defaults.output_dir }}">
+
+        <label>
+          Modelo Ollama
+          <input type="text" name="model" value="{{ defaults.model }}" required>
+        </label>
+
+        <div class="compact-row">
+          <label>
+            Conexão Ollama
+            <select id="ollama-mode" name="ollama_mode">
+              <option value="local" {% if defaults.ollama_mode != "remote" %}selected{% endif %}>Local</option>
+              <option value="remote" {% if defaults.ollama_mode == "remote" %}selected{% endif %}>IP/URL</option>
+            </select>
+          </label>
+
+          <label id="ollama-endpoint-wrap">
+            IP:Porta ou URL/DNS
+            <input
+              type="text"
+              id="ollama-endpoint"
+              name="ollama_endpoint"
+              value="{{ defaults.ollama_endpoint }}"
+              placeholder="192.168.1.10:11434 ou https://ollama.seudns.com"
+            >
+          </label>
+        </div>
+
+        <label>
+          Batch size
+          <input type="number" name="batch_size" min="1" value="{{ defaults.batch_size }}" required>
+        </label>
+
+        <label>
+          Timeout (segundos)
+          <input type="number" name="timeout" min="10" value="{{ defaults.timeout }}" required>
+        </label>
+
+        <div class="checks">
+          <button id="save-config-btn" type="button" class="secondary">Salvar Configuração</button>
+          <button id="reset-config-btn" type="button" class="secondary">Resetar Configuração</button>
+        </div>
+
+        <div class="checks">
+          <label class="check"><input type="checkbox" name="turbo"> Modo turbo</label>
+          <label class="check"><input type="checkbox" name="clear_cache"> Limpar cache antes</label>
+          <label class="check"><input type="checkbox" name="no_cache"> Desativar cache</label>
+        </div>
+
+        <button id="start-btn" type="submit">Iniciar Tradução</button>
+        <button id="download-btn" type="button" class="secondary">Download Processados</button>
+        <button id="cleanup-btn" type="button" class="danger">Limpeza do trabalho anterior</button>
+
+        <div class="file-list-box">
+          <p class="file-list-title">Arquivos Processados (.ass)</p>
+          <ul id="output-files-list" class="file-list">
+            <li class="empty-item">Nenhum arquivo processado.</li>
+          </ul>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel status-panel">
+      <div class="status-row">
+        <h2>Status</h2>
+        <div class="status-progress">
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <span id="progress-text" class="progress-text">0%</span>
+        </div>
+        <span id="status-badge" class="badge idle">Parado</span>
+      </div>
+      <p id="status-meta" class="meta">Sem execução.</p>
+      <pre id="log-box" class="log-box">Aguardando execução...</pre>
+    </section>
+  </main>
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+    const form = document.getElementById('translation-form');
+    const startBtn = document.getElementById('start-btn');
+    const statusBadge = document.getElementById('status-badge');
+    const progressFill = document.getElementById('progress-fill');
+    const progressText = document.getElementById('progress-text');
+    const statusMeta = document.getElementById('status-meta');
+    const logBox = document.getElementById('log-box');
+    const uploadBtn = document.getElementById('upload-btn');
+    const uploadMeta = document.getElementById('upload-meta');
+    const filesInput = document.getElementById('ass-files');
+    const downloadBtn = document.getElementById('download-btn');
+    const cleanupBtn = document.getElementById('cleanup-btn');
+    const inputFilesList = document.getElementById('input-files-list');
+    const outputFilesList = document.getElementById('output-files-list');
+    const csrfTokenField = document.querySelector('input[name="csrf_token"]');
+    const csrfToken = csrfTokenField ? csrfTokenField.value : '';
+    const modelInput = form.querySelector('input[name="model"]');
+    const ollamaModeInput = form.querySelector('select[name="ollama_mode"]');
+    const ollamaEndpointWrap = document.getElementById('ollama-endpoint-wrap');
+    const ollamaEndpointInput = form.querySelector('input[name="ollama_endpoint"]');
+    const batchSizeInput = form.querySelector('input[name="batch_size"]');
+    const timeoutInput = form.querySelector('input[name="timeout"]');
+    const saveConfigBtn = document.getElementById('save-config-btn');
+    const resetConfigBtn = document.getElementById('reset-config-btn');
+    const toastRegion = document.getElementById('toast-region');
+    let statusStream = null;
+    let fallbackStatusInterval = null;
+    let toastTimer = null;
+
+    function applyResponsiveMode() {
+      const compact = window.innerWidth < 1100 || window.innerHeight < 760;
+      document.body.classList.toggle('compact-mode', compact);
+    }
+
+    function showToast(message, kind = 'success') {
+      if (!toastRegion) return;
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+        toastTimer = null;
+      }
+
+      toastRegion.textContent = message;
+      toastRegion.className = `toast-region show ${kind}`;
+      toastTimer = setTimeout(() => {
+        toastRegion.className = 'toast-region';
+      }, 3200);
+    }
+
+    function setRunningStyle(running) {
+      if (running) {
+        statusBadge.textContent = 'Executando';
+        statusBadge.className = 'badge running';
+        startBtn.disabled = true;
+      } else {
+        statusBadge.textContent = 'Parado';
+        statusBadge.className = 'badge idle';
+        startBtn.disabled = false;
+      }
+    }
+
+    function updateOllamaEndpointVisibility() {
+      if (!ollamaModeInput || !ollamaEndpointWrap) return;
+      const isRemote = ollamaModeInput.value === 'remote';
+      ollamaEndpointWrap.style.display = isRemote ? 'grid' : 'none';
+      if (ollamaEndpointInput) {
+        ollamaEndpointInput.required = isRemote;
+      }
+    }
+
+    function updateStatusView(data) {
+      setRunningStyle(data.running);
+      const pctRaw = Number(data.progress_percent);
+      const pct = Number.isFinite(pctRaw) ? Math.max(0, Math.min(100, pctRaw)) : 0;
+      if (progressFill) {
+        progressFill.style.width = `${pct}%`;
+        let progressStateClass = 'state-idle';
+        if (data.running) {
+          progressStateClass = 'state-running';
+        } else if (data.return_code === 0) {
+          progressStateClass = 'state-success';
+        } else if (data.return_code !== null) {
+          progressStateClass = 'state-error';
+        }
+        progressFill.className = `progress-fill ${progressStateClass}`;
+        const track = progressFill.parentElement;
+        if (track) track.setAttribute('aria-valuenow', String(pct));
+      }
+      if (progressText) {
+        progressText.textContent = data.progress_label || `${pct}%`;
+      }
+
+      if (data.running) {
+        statusMeta.textContent = `Iniciado: ${data.started_at || '-'} | Código: em andamento`;
+      } else if (data.finished_at) {
+        const code = data.return_code === null ? '-' : data.return_code;
+        statusMeta.textContent = `Iniciado: ${data.started_at || '-'} | Finalizado: ${data.finished_at} | Código: ${code}`;
+      } else {
+        statusMeta.textContent = 'Sem execução.';
+      }
+
+      logBox.textContent = data.logs || 'Aguardando execução...';
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/status?ts=' + Date.now(), { cache: 'no-store' });
+        const data = await res.json();
+        updateStatusView(data);
+      } catch (err) {
+        statusMeta.textContent = `Erro ao buscar status: ${err}`;
+      }
+    }
+
+    function startStatusStream() {
+      if (!window.EventSource) {
+        fallbackStatusInterval = setInterval(refreshStatus, 1200);
+        return;
+      }
+
+      try {
+        statusStream = new EventSource('/status/stream');
+        statusStream.onmessage = (event) => {
+          if (!event || !event.data) return;
+          try {
+            const data = JSON.parse(event.data);
+            updateStatusView(data);
+          } catch (_) {
+            // Ignore malformed chunks and keep stream alive.
+          }
+        };
+        statusStream.onerror = () => {
+          if (fallbackStatusInterval) return;
+          fallbackStatusInterval = setInterval(refreshStatus, 1200);
+        };
+      } catch (_) {
+        fallbackStatusInterval = setInterval(refreshStatus, 1200);
+      }
+    }
+
+    function sendUiHeartbeat() {
+      if (!csrfToken) return;
+
+      const payload = new URLSearchParams();
+      payload.set('csrf_token', csrfToken);
+
+      if (navigator.sendBeacon) {
+        const blob = new Blob([payload.toString()], {
+          type: 'application/x-www-form-urlencoded;charset=UTF-8',
+        });
+        navigator.sendBeacon('/ui-heartbeat', blob);
+        return;
+      }
+
+      fetch('/ui-heartbeat', {
+        method: 'POST',
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+    }
+
+    function applyConfig(config) {
+      if (!config) return;
+      if (typeof config.model === 'string') modelInput.value = config.model;
+      if (typeof config.ollama_mode === 'string') ollamaModeInput.value = config.ollama_mode;
+      if (typeof config.ollama_endpoint === 'string') ollamaEndpointInput.value = config.ollama_endpoint;
+      if (typeof config.batch_size === 'string') batchSizeInput.value = config.batch_size;
+      if (typeof config.timeout === 'string') timeoutInput.value = config.timeout;
+      updateOllamaEndpointVisibility();
+    }
+
+    function renderFileList(target, items, emptyMessage) {
+      target.innerHTML = '';
+      if (!items || items.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'empty-item';
+        li.textContent = emptyMessage;
+        target.appendChild(li);
+        return;
+      }
+
+      for (const item of items) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        target.appendChild(li);
+      }
+    }
+
+    async function refreshFiles() {
+      try {
+        const inputDir = './entrada';
+        const outputDir = './saida';
+        const qs = new URLSearchParams({
+          input_dir: inputDir,
+          output_dir: outputDir,
+          ts: String(Date.now()),
+        });
+
+        const res = await fetch('/files?' + qs.toString(), { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          return;
+        }
+
+        renderFileList(inputFilesList, data.input_files, 'Nenhum arquivo encontrado.');
+        renderFileList(outputFilesList, data.output_files, 'Nenhum arquivo processado.');
+      } catch (err) {
+        console.error('Erro ao atualizar lista de arquivos', err);
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      const body = new FormData(form);
+      startBtn.disabled = true;
+
+      try {
+        const res = await fetch('/start', { method: 'POST', body });
+        const data = await res.json();
+
+        if (!res.ok || !data.ok) {
+          alert(data.error || 'Falha ao iniciar a tradução.');
+          startBtn.disabled = false;
+          return;
+        }
+
+        await refreshStatus();
+        await refreshFiles();
+      } catch (err) {
+        alert(`Erro ao iniciar: ${err}`);
+        startBtn.disabled = false;
+      }
+    });
+
+    uploadBtn.addEventListener('click', async () => {
+      const files = filesInput.files;
+      if (!files || files.length === 0) {
+        alert('Selecione pelo menos um arquivo .ass para enviar.');
+        return;
+      }
+
+      const payload = new FormData();
+      const inputDir = './entrada';
+      // Include CSRF token.
+      const csrfMeta = document.querySelector('input[name="csrf_token"]');
+      if (csrfMeta) payload.append('csrf_token', csrfMeta.value);
+      payload.append('input_dir', inputDir);
+      for (const file of files) {
+        payload.append('ass_files', file);
+      }
+
+      uploadBtn.disabled = true;
+      uploadMeta.textContent = 'Enviando arquivos...';
+
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: payload });
+        const data = await res.json();
+
+        if (!res.ok || !data.ok) {
+          uploadMeta.textContent = data.error || 'Falha no upload.';
+          return;
+        }
+
+        const enviados = (data.saved || []).length;
+        const ignorados = (data.skipped || []).length;
+        uploadMeta.textContent = `Upload concluído. Enviados: ${enviados} | Ignorados: ${ignorados}`;
+        filesInput.value = "";
+        await refreshFiles();
+      } catch (err) {
+        uploadMeta.textContent = `Erro no upload: ${err}`;
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      const outputDir = './saida';
+      const url = '/download-output?output_dir=' + encodeURIComponent(outputDir) + '&ts=' + Date.now();
+      window.location.href = url;
+    });
+
+    cleanupBtn.addEventListener('click', async () => {
+      const confirmDelete = window.confirm('Deseja limpar as pastas de entrada e saída?');
+      if (!confirmDelete) {
+        return;
+      }
+
+      cleanupBtn.disabled = true;
+      uploadMeta.textContent = 'Limpando trabalho anterior...';
+
+      // Include CSRF token.
+      const csrfMeta = document.querySelector('input[name="csrf_token"]');
+      const body = new FormData();
+      if (csrfMeta) body.append('csrf_token', csrfMeta.value);
+
+      try {
+        const res = await fetch('/cleanup', { method: 'POST', body });
+        const data = await res.json();
+
+        if (!res.ok || !data.ok) {
+          uploadMeta.textContent = data.error || 'Falha ao limpar pastas.';
+          return;
+        }
+
+        const cacheInfo = data.cache_cleared ? 'sim' : 'não';
+        uploadMeta.textContent = `Limpeza concluída. Entrada removidos: ${data.removed_input} | Saída removidos: ${data.removed_output} | Cache limpo: ${cacheInfo}`;
+        await refreshFiles();
+        await refreshStatus();
+      } catch (err) {
+        uploadMeta.textContent = `Erro na limpeza: ${err}`;
+      } finally {
+        cleanupBtn.disabled = false;
+      }
+    });
+
+    saveConfigBtn.addEventListener('click', async () => {
+      saveConfigBtn.disabled = true;
+      const payload = new FormData();
+      payload.append('csrf_token', csrfToken);
+      payload.append('model', modelInput.value);
+      payload.append('ollama_mode', ollamaModeInput.value);
+      payload.append('ollama_endpoint', ollamaEndpointInput.value);
+      payload.append('batch_size', batchSizeInput.value);
+      payload.append('timeout', timeoutInput.value);
+
+      try {
+        const res = await fetch('/config/save', { method: 'POST', body: payload });
+        const data = await res.json();
+
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Falha ao salvar configuração.', 'error');
+          return;
+        }
+
+        applyConfig(data.config);
+        showToast(data.message || 'Configuração salva.');
+      } catch (err) {
+        showToast(`Erro ao salvar configuração: ${err}`, 'error');
+      } finally {
+        saveConfigBtn.disabled = false;
+      }
+    });
+
+    resetConfigBtn.addEventListener('click', async () => {
+      const confirmReset = window.confirm('Deseja resetar os campos de configuração para o padrão?');
+      if (!confirmReset) {
+        return;
+      }
+
+      resetConfigBtn.disabled = true;
+      const payload = new FormData();
+      payload.append('csrf_token', csrfToken);
+
+      try {
+        const res = await fetch('/config/reset', { method: 'POST', body: payload });
+        const data = await res.json();
+
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Falha ao resetar configuração.', 'error');
+          return;
+        }
+
+        applyConfig(data.config);
+        showToast(data.message || 'Configuração resetada.');
+      } catch (err) {
+        showToast(`Erro ao resetar configuração: ${err}`, 'error');
+      } finally {
+        resetConfigBtn.disabled = false;
+      }
+    });
+
+    applyResponsiveMode();
+    updateOllamaEndpointVisibility();
+    if (ollamaModeInput) {
+      ollamaModeInput.addEventListener('change', updateOllamaEndpointVisibility);
+    }
+    window.addEventListener('resize', applyResponsiveMode);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', applyResponsiveMode);
+    }
+
+    refreshStatus();
+    startStatusStream();
+    refreshFiles();
+    sendUiHeartbeat();
+    const heartbeatInterval = setInterval(sendUiHeartbeat, 2000);
+    const filesInterval = setInterval(refreshFiles, 4000);
+    window.addEventListener('beforeunload', () => {
+      clearInterval(heartbeatInterval);
+      clearInterval(filesInterval);
+      if (fallbackStatusInterval) clearInterval(fallbackStatusInterval);
+      if (statusStream) statusStream.close();
+    });
+  </script>
+</body>
+</html>
+

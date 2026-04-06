@@ -1,0 +1,4 @@
+flask>=3.0
+pysubs2>=1.6
+ollama>=0.4
+tqdm>=4.66

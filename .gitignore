@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local/runtime artifacts
+build/
+dist/
+_runtime/
+.pycache_tmp/
+
+# App data (local)
+entrada/
+saida/
+translation_cache.json
+web_config.json
+*.log
+
+# Local tooling folders
+.claude/
+.qwen/
+
+# Secrets
+.env
+.env.*
