@@ -1,18 +1,6 @@
 name: Release GUI
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "web_app.py"
-      - "translate_ass_fast.py"
-      - "templates/**"
-      - "static/**"
-      - "requirements.txt"
-      - "TradutorASS-GUI.spec"
-      - "build_gui_exe.bat"
-      - ".github/workflows/release-gui.yml"
   workflow_dispatch:
 
 permissions:
