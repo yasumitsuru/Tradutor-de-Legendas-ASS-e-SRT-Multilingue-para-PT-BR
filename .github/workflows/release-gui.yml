@@ -1,0 +1,175 @@
+name: Release GUI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "web_app.py"
+      - "translate_ass_fast.py"
+      - "templates/**"
+      - "static/**"
+      - "requirements.txt"
+      - "TradutorASS-GUI.spec"
+      - "build_gui_exe.bat"
+      - ".github/workflows/release-gui.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build GUI executable
+        shell: pwsh
+        run: |
+          ./build_gui_exe.bat
+
+      - name: Prepare release artifacts
+        id: artifact_meta
+        shell: pwsh
+        run: |
+          $exePath = "dist/TradutorASS-GUI/TradutorASS-GUI.exe"
+          if (-not (Test-Path -LiteralPath $exePath)) {
+            throw "Executavel nao encontrado em: $exePath"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLower()
+          $tag = "gui-v$(Get-Date -Format 'yyyy.MM.dd-HHmm')-${{ github.run_number }}"
+          $releaseName = "GUI Release $(Get-Date -Format 'yyyy-MM-dd HH:mm') #${{ github.run_number }}"
+          $zipPath = "TradutorASS-GUI-$tag.zip"
+
+          Compress-Archive -Path "dist/TradutorASS-GUI/*" -DestinationPath $zipPath -Force
+          Set-Content -LiteralPath "TradutorASS-GUI.sha256" -Value "$hash  TradutorASS-GUI.exe" -Encoding ascii
+
+          "exe_hash=$hash" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+
+      - name: Get latest release tag
+        id: latest_release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const { data } = await github.rest.repos.getLatestRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              core.setOutput("tag", data.tag_name || "");
+            } catch (error) {
+              if (error.status === 404) {
+                core.setOutput("tag", "");
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Generate release notes
+        shell: pwsh
+        run: |
+          $prevTag = "${{ steps.latest_release.outputs.tag }}"
+          $commitLines = @()
+          $changeLines = @()
+
+          if ($prevTag) {
+            $range = "$prevTag..HEAD"
+            $commitLines = git log --pretty=format:"- %h %s" $range
+            $changeLines = git diff --name-status $range
+          } else {
+            $commitLines = git log -n 20 --pretty=format:"- %h %s"
+            $changeLines = git show --name-status --pretty="" HEAD
+          }
+
+          if (-not $commitLines) {
+            $commitLines = @("- Sem commits para resumir.")
+          }
+
+          $added = New-Object System.Collections.Generic.List[string]
+          $removed = New-Object System.Collections.Generic.List[string]
+          $modified = New-Object System.Collections.Generic.List[string]
+
+          foreach ($line in $changeLines) {
+            if (-not $line) { continue }
+            $parts = $line -split "`t", 2
+            if ($parts.Count -lt 2) { continue }
+            $status = $parts[0]
+            $file = $parts[1]
+
+            if ($status -match "^A") {
+              $added.Add($file)
+            } elseif ($status -match "^D") {
+              $removed.Add($file)
+            } else {
+              $modified.Add($file)
+            }
+          }
+
+          function Format-Section([string]$title, [System.Collections.Generic.List[string]]$items) {
+            if ($items.Count -eq 0) {
+              return "### $title`n- Nenhum"
+            }
+            $lines = $items | ForEach-Object { "- $_" }
+            return "### $title`n" + ($lines -join "`n")
+          }
+
+          $summaryAdded = Format-Section -title "Adicionado" -items $added
+          $summaryRemoved = Format-Section -title "Removido" -items $removed
+          $summaryModified = Format-Section -title "Alterado" -items $modified
+          $commitSummary = ($commitLines -join "`n")
+          $hash = "${{ steps.artifact_meta.outputs.exe_hash }}"
+          $generatedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
+
+          $notes = @"
+          ## Resumo da versao (automatizado)
+
+          $summaryAdded
+
+          $summaryRemoved
+
+          $summaryModified
+
+          ## Commits
+          $commitSummary
+
+          ## Build
+          - Executavel: TradutorASS-GUI.exe
+          - SHA256: $hash
+          - Gerado em: $generatedAt
+          "@
+
+          Set-Content -LiteralPath "release_notes.md" -Value $notes -Encoding UTF8
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.artifact_meta.outputs.tag }}
+          name: ${{ steps.artifact_meta.outputs.release_name }}
+          body_path: release_notes.md
+          files: |
+            ${{ steps.artifact_meta.outputs.zip_path }}
+            dist/TradutorASS-GUI/TradutorASS-GUI.exe
+            TradutorASS-GUI.sha256
+          draft: false
+          prerelease: false
