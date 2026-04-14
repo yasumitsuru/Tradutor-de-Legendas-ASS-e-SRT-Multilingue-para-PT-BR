@@ -44,6 +44,7 @@ STATIC_DIR = RESOURCE_DIR / "static"
 APP_HOST = "127.0.0.1"
 APP_PORT = 7860
 APP_URL = f"http://{APP_HOST}:{APP_PORT}"
+LOCAL_OLLAMA_HOST = "http://127.0.0.1:11434"
 UI_HEARTBEAT_TIMEOUT_SECONDS = 8.0
 DEFAULT_FORM_VALUES: dict[str, str] = {
     "input_dir": "./entrada",
@@ -220,20 +221,42 @@ def _is_model_not_found_error(exc: Exception) -> bool:
 
 def _ensure_ollama_model_available(model_name: str, ollama_host: str | None = None) -> tuple[bool, str]:
     """Confere se o modelo informado está disponível no endpoint Ollama selecionado."""
-    try:
-        client = ollama.Client(host=ollama_host) if ollama_host else ollama.Client()
-        client.show(model_name)
-        return True, ""
-    except Exception as exc:
-        if _is_model_not_found_error(exc):
-            endpoint_hint = f' no endpoint "{ollama_host}"' if ollama_host else ""
-            return (
-                False,
-                f'Modelo "{model_name}" não está disponível no Ollama{endpoint_hint}. '
-                f'Instale antes com: ollama pull {model_name}',
-            )
-        where = f' no endpoint "{ollama_host}"' if ollama_host else ""
-        return False, f"Não foi possível validar o modelo no Ollama{where}: {exc}"
+    candidate_hosts: list[str] = []
+    if ollama_host:
+        candidate_hosts.append(ollama_host)
+    else:
+        # Em modo local, não depender de OLLAMA_HOST do ambiente evita falhas
+        # quando a variável está com valor de bind (ex.: 0.0.0.0:11434).
+        candidate_hosts.append(LOCAL_OLLAMA_HOST)
+        env_host_raw = (os.environ.get("OLLAMA_HOST") or "").strip()
+        if env_host_raw:
+            env_host = env_host_raw
+            if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", env_host):
+                env_host = f"http://{env_host}"
+            if env_host not in candidate_hosts:
+                candidate_hosts.append(env_host)
+
+    last_exc: Exception | None = None
+    last_host: str | None = None
+
+    for host in candidate_hosts:
+        try:
+            client = ollama.Client(host=host)
+            client.show(model_name)
+            return True, ""
+        except Exception as exc:
+            if _is_model_not_found_error(exc):
+                endpoint_hint = f' no endpoint "{host}"' if host else ""
+                return (
+                    False,
+                    f'Modelo "{model_name}" não está disponível no Ollama{endpoint_hint}. '
+                    f'Instale antes com: ollama pull {model_name}',
+                )
+            last_exc = exc
+            last_host = host
+
+    where = f' no endpoint "{last_host}"' if last_host else ""
+    return False, f"Não foi possível validar o modelo no Ollama{where}: {last_exc}"
 
 
 def _secure_filename(name: str) -> str:
