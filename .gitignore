@@ -28,6 +28,7 @@ web_config.json
 .claude/
 .qwen/
 contexto CODEX/
+NSSM win64/
 
 # Secrets
 .env
