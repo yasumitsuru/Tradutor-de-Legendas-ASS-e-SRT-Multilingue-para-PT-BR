@@ -1,4 +1,12 @@
+# Dependencias de execucao
 flask>=3.0
-pysubs2>=1.6
 ollama>=0.4
+pysubs2>=1.6
 tqdm>=4.66
+
+# Dependencia de build (gera o .exe via build_gui_exe.bat)
+pyinstaller>=6.0
+
+# Modelo de IA (Ollama)
+# Nao e pacote pip. Instale apos o pip install:
+# ollama pull qwen2.5:14b
