@@ -637,12 +637,41 @@ def _clear_directory_contents(directory: Path) -> int:
     return removed
 
 
+def _latest_commit_date_label() -> str:
+    """Retorna a data do último commit local para exibição no footer da interface."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "log",
+                "-1",
+                "--date=format:%d/%m/%Y %H:%M",
+                "--pretty=format:%ad",
+            ],
+            cwd=str(SOURCE_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2,
+        )
+        label = (result.stdout or "").strip()
+        return label or "não disponível"
+    except Exception:
+        return "não disponível"
+
+
 @app.route("/", methods=["GET"])
 def index() -> str:
     """Renderiza a página inicial com defaults efetivos e token CSRF."""
     defaults = _effective_defaults()
     csrf_token = _generate_csrf()
-    return render_template("index.html", defaults=defaults, csrf_token=csrf_token)
+    commit_date = _latest_commit_date_label()
+    return render_template(
+        "index.html",
+        defaults=defaults,
+        csrf_token=csrf_token,
+        commit_date=commit_date,
+    )
 
 
 @app.route("/favicon.ico", methods=["GET"])
