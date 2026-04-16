@@ -10,6 +10,7 @@ import threading
 import tempfile
 import webbrowser
 import zipfile
+import hashlib
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -279,13 +280,36 @@ def _secure_filename(name: str) -> str:
     name = name.strip(" .")
     return name or "arquivo"
 
+
+def _resolve_flask_secret_key() -> str:
+    """Retorna chave de sessao estavel para CSRF, especialmente em ambiente serverless."""
+    from_env = (os.environ.get("FLASK_SECRET_KEY") or os.environ.get("SECRET_KEY") or "").strip()
+    if from_env:
+        return from_env
+
+    if IS_VERCEL:
+        # Stable fallback in Vercel to avoid CSRF/session invalidation across instances.
+        seed_parts = [
+            os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", ""),
+            os.environ.get("VERCEL_URL", ""),
+            os.environ.get("VERCEL_GIT_COMMIT_SHA", ""),
+        ]
+        seed = "|".join(part for part in seed_parts if part) or "tradutor-ass-vercel"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    return secrets.token_hex(32)
+
+
 app = Flask(
     __name__,
     template_folder=str(TEMPLATES_DIR),
     static_folder=str(STATIC_DIR),
 )
-app.secret_key = secrets.token_hex(32)
+app.secret_key = _resolve_flask_secret_key()
 app.config["WTF_CSRF_ENABLED"] = False  # Manual CSRF, no Flask-WTF dependency.
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+if IS_VERCEL:
+    app.config["SESSION_COOKIE_SECURE"] = True
 
 # ---------------------------------------------------------------------------
 # CSRF protection (token-based, stored in session + hidden form field)
@@ -647,8 +671,73 @@ def _clear_directory_contents(directory: Path) -> int:
     return removed
 
 
+_commit_date_cache: dict[str, Any] = {"value": None, "expires_at": 0.0}
+
+
+def _format_commit_date_label(raw_iso: str) -> str | None:
+    """Formata datas ISO (ex.: GitHub API) para rótulo dd/mm/aaaa HH:MM."""
+    value = (raw_iso or "").strip()
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    suffix = " UTC" if value.endswith("Z") else ""
+    return f"{dt.strftime('%d/%m/%Y %H:%M')}{suffix}"
+
+
+def _latest_commit_date_from_github_label() -> str | None:
+    """Busca a data do commit atual via GitHub API quando git local não está disponível."""
+    owner = (os.environ.get("VERCEL_GIT_REPO_OWNER") or "").strip()
+    repo = (os.environ.get("VERCEL_GIT_REPO_SLUG") or "").strip()
+    sha = (os.environ.get("VERCEL_GIT_COMMIT_SHA") or "").strip()
+    if not owner or not repo:
+        return None
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "tradutor-ass-web",
+    }
+    github_token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+
+    try:
+        if sha:
+            url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}"
+            request_obj = urlrequest.Request(url, headers=headers)
+            with urlrequest.urlopen(request_obj, timeout=3.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        else:
+            url = f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=1"
+            request_obj = urlrequest.Request(url, headers=headers)
+            with urlrequest.urlopen(request_obj, timeout=3.0) as response:
+                payload_list = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload_list, list) or not payload_list:
+                return None
+            payload = payload_list[0]
+
+        commit = payload.get("commit") if isinstance(payload, dict) else None
+        if not isinstance(commit, dict):
+            return None
+
+        committer = commit.get("committer") if isinstance(commit.get("committer"), dict) else {}
+        author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+        raw_date = committer.get("date") or author.get("date") or ""
+        return _format_commit_date_label(str(raw_date))
+    except Exception:
+        return None
+
+
 def _latest_commit_date_label() -> str:
-    """Retorna a data do último commit local para exibição no footer da interface."""
+    """Retorna data do commit para o footer (git local, com fallback para GitHub)."""
+    now = time.monotonic()
+    cached_value = _commit_date_cache.get("value")
+    cached_expires_at = float(_commit_date_cache.get("expires_at") or 0.0)
+    if isinstance(cached_value, str) and cached_value and now < cached_expires_at:
+        return cached_value
+
     try:
         result = subprocess.run(
             [
@@ -665,9 +754,23 @@ def _latest_commit_date_label() -> str:
             timeout=2,
         )
         label = (result.stdout or "").strip()
-        return label or "não disponível"
+        if label:
+            _commit_date_cache["value"] = label
+            _commit_date_cache["expires_at"] = now + 120.0
+            return label
     except Exception:
-        return "não disponível"
+        pass
+
+    github_label = _latest_commit_date_from_github_label()
+    if github_label:
+        _commit_date_cache["value"] = github_label
+        _commit_date_cache["expires_at"] = now + 300.0
+        return github_label
+
+    fallback = "não disponível"
+    _commit_date_cache["value"] = fallback
+    _commit_date_cache["expires_at"] = now + 30.0
+    return fallback
 
 
 @app.route("/", methods=["GET"])
