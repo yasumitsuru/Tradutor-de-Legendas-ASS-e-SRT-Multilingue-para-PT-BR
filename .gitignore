@@ -18,8 +18,6 @@ _runtime/
 .pycache_tmp/
 
 # App data (local)
-entrada/
-saida/
 translation_cache.json
 web_config.json
 *.log
