@@ -34,7 +34,13 @@ from flask import (
 
 SOURCE_DIR = Path(__file__).resolve().parent
 IS_FROZEN = bool(getattr(sys, "frozen", False))
-BASE_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else SOURCE_DIR
+IS_VERCEL = bool(os.environ.get("VERCEL")) or bool(os.environ.get("VERCEL_ENV"))
+if IS_FROZEN:
+    BASE_DIR = Path(sys.executable).resolve().parent
+elif IS_VERCEL:
+    BASE_DIR = Path("/tmp/tradutor-ass-web")
+else:
+    BASE_DIR = SOURCE_DIR
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_DIR)).resolve()
 SCRIPT_PATH = SOURCE_DIR / "translate_ass_fast.py"
 CACHE_PATH = BASE_DIR / "translation_cache.json"
@@ -46,16 +52,20 @@ APP_PORT = 7860
 APP_URL = f"http://{APP_HOST}:{APP_PORT}"
 LOCAL_OLLAMA_HOST = "http://127.0.0.1:11434"
 UI_HEARTBEAT_TIMEOUT_SECONDS = 8.0
+DEFAULT_REMOTE_OLLAMA_ENDPOINT = (os.environ.get("OLLAMA_ENDPOINT") or "").strip()
 DEFAULT_FORM_VALUES: dict[str, str] = {
     "input_dir": "./entrada",
     "output_dir": "./saida",
     "model": "qwen2.5:14b",
     "batch_size": "15",
     "timeout": "300",
-    "ollama_mode": "local",
-    "ollama_endpoint": "",
+    "ollama_mode": "remote" if IS_VERCEL else "local",
+    "ollama_endpoint": DEFAULT_REMOTE_OLLAMA_ENDPOINT,
 }
 CONFIG_KEYS = ("model", "batch_size", "timeout", "ollama_mode", "ollama_endpoint")
+
+if IS_VERCEL:
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 _ALLOWED_MODEL_RE = re.compile(r"^[a-z0-9._:/@-]+$", re.IGNORECASE)
 

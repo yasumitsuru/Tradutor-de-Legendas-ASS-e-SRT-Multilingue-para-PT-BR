@@ -1,0 +1,10 @@
+build
+dist
+_runtime
+__pycache__
+entrada
+saida
+contexto CODEX
+NSSM win64
+*.spec
+
