@@ -159,10 +159,68 @@ class FixedASSTranslator:
         """Restaura os escapes ASS a partir dos tokens apos receber a traducao."""
         if not isinstance(text, str):
             return text
-        restored = re.sub(r"\s*\[\[\[ASS_BR\]\]\]\s*", r"\\N", text)
-        restored = re.sub(r"\s*\[\[\[ASS_br\]\]\]\s*", r"\\n", restored)
-        restored = re.sub(r"\s*\[\[\[ASS_NBSP\]\]\]\s*", r"\\h", restored)
+        # O modelo as vezes devolve tokens parcialmente deformados, por exemplo
+        # "[[[ASS_NBSP]][[ASS_BR]]]". Aceitar 1 a 3 colchetes em cada lado
+        # evita que marcadores internos vazem para o arquivo .ass final.
+        restored = re.sub(r"\s*\[{1,3}\s*ASS_BR\s*\]{1,3}\s*", r"\\N", text)
+        restored = re.sub(r"\s*\[{1,3}\s*ASS_br\s*\]{1,3}\s*", r"\\n", restored)
+        restored = re.sub(r"\s*\[{1,3}\s*ASS_NBSP\s*\]{1,3}\s*", r"\\h", restored)
         return restored.strip()
+
+    def has_internal_ass_tokens(self, text: str) -> bool:
+        """Detecta marcadores internos que nunca devem chegar ao arquivo final."""
+        if not isinstance(text, str):
+            return False
+        return "ASS_" in text or "[[[" in text or "]]]" in text
+
+    def _insert_missing_ass_breaks(self, text: str, token: str, missing_count: int) -> str:
+        """Insere quebras ausentes em pontos legiveis para manter a estrutura ASS."""
+        repaired = text.strip()
+        for _ in range(max(0, missing_count)):
+            segments = repaired.split(token)
+            longest_index = max(range(len(segments)), key=lambda idx: len(segments[idx]))
+            segment = segments[longest_index]
+            if not segment:
+                segments[longest_index] = token
+                repaired = token.join(segments)
+                continue
+
+            middle = len(segment) // 2
+            candidates = [match.start() for match in re.finditer(r"\s+", segment)]
+            if candidates:
+                split_at = min(candidates, key=lambda pos: abs(pos - middle))
+                left = segment[:split_at].rstrip()
+                right = segment[split_at:].lstrip()
+                segments[longest_index] = f"{left}{token}{right}"
+            else:
+                segments[longest_index] = f"{segment[:middle]}{token}{segment[middle:]}"
+            repaired = token.join(segments)
+        return repaired.strip()
+
+    def repair_ass_escapes(self, source_text: str, translated_text: str) -> str:
+        """Restaura/normaliza escapes ASS e remove marcadores inventados pelo modelo."""
+        repaired = self.restore_ass_breaks_from_model(translated_text)
+
+        # Se a origem nao tinha espaco rigido, qualquer \h veio do modelo.
+        # Remover antes de \N evita sequencias estranhas como "\h\N".
+        if r"\h" not in source_text:
+            repaired = re.sub(r"\\h(?=\\[Nn])", "", repaired)
+            repaired = repaired.replace(r"\h", " ")
+
+        for token in (r"\N", r"\n"):
+            expected = source_text.count(token)
+            current = repaired.count(token)
+            if current < expected:
+                repaired = self._insert_missing_ass_breaks(repaired, token, expected - current)
+            elif current > expected:
+                extra = current - expected
+                for _ in range(extra):
+                    repaired = repaired.replace(token, " ", 1)
+
+        # Ultimo anteparo: qualquer marcador ASS_* remanescente e removido para
+        # impedir que lixo de controle apareca na legenda final.
+        repaired = re.sub(r"\[{1,3}\s*ASS_[A-Za-z_]+\s*\]{1,3}", "", repaired)
+        return re.sub(r"[ \t]{2,}", " ", repaired).strip()
 
     def normalize_apostrophes(self, text: str) -> str:
         """Padroniza apostrofos para facilitar comparacoes e substituicoes por regex."""
@@ -299,10 +357,12 @@ class FixedASSTranslator:
     ) -> List[str]:
         """Traduz um batch via Ollama com retry, timeout e fallback para texto original."""
         fallback_texts = original_texts if original_texts and len(original_texts) == len(texts) else texts
-        numbered_lines = "\n".join([f"{i+1}. {text}" for i, text in enumerate(texts)])
+        numbered_lines = "\n".join([f"ID{i+1:03d}: {text}" for i, text in enumerate(texts)])
         prompt = (
             f"Traduza cada frase para {self.config['target_language']}. Mantenha a numeração.\n"
+            "Retorne exatamente uma linha por ID no formato ID001: tradução.\n"
             "Mantenha os tokens [[[ASS_BR]]], [[[ASS_br]]] e [[[ASS_NBSP]]] exatamente como estão.\n"
+            "Não crie novos tokens, não adicione \\h e não misture o texto de IDs diferentes.\n"
             f"{numbered_lines}\n"
             "Tradução:"
         )
@@ -329,10 +389,13 @@ class FixedASSTranslator:
                 response_text = response['response'].strip()
                 lines = response_text.split('\n')
                 
+                last_num = None
                 for line in lines:
                     line = line.strip()
                     if not line: continue
-                    match = re.match(r'^(\d+)[\.\-:\)]\s*(.*)$', line)
+                    match = re.match(r'^ID\s*0*(\d+)\s*[:\-\)]\s*(.*)$', line, flags=re.IGNORECASE)
+                    if not match:
+                        match = re.match(r'^(\d+)[\.\-:\)]\s*(.*)$', line)
                     if match:
                         num = int(match.group(1))
                         text = match.group(2).strip()
@@ -340,17 +403,20 @@ class FixedASSTranslator:
                             while len(translated) < num:
                                 translated.append(None)
                             translated[num-1] = text if text else fallback_texts[num-1]
-                    elif len(translated) < len(texts) and not any(c.isdigit() for c in line[:3]):
-                        if translated and translated[-1] is not None:
-                            translated[-1] += " " + line
-                        elif not translated:
-                            translated.append(line)
+                            last_num = num
+                    elif last_num is not None and 1 <= last_num <= len(texts):
+                        current = translated[last_num - 1]
+                        translated[last_num - 1] = f"{current} {line}".strip() if current else line
                             
                 result = []
                 for i in range(len(texts)):
                     if i < len(translated) and translated[i] is not None and translated[i].strip():
-                        restored = self.restore_ass_breaks_from_model(translated[i])
-                        result.append(restored if restored else fallback_texts[i])
+                        restored = self.repair_ass_escapes(fallback_texts[i], translated[i])
+                        if self.has_internal_ass_tokens(restored):
+                            print(f"   ⚠️ Batch {batch_num}: tokens internos na linha {i+1}; usando original")
+                            result.append(fallback_texts[i])
+                        else:
+                            result.append(restored if restored else fallback_texts[i])
                     else:
                         result.append(fallback_texts[i])
                         
@@ -405,6 +471,13 @@ class FixedASSTranslator:
                 for item, translated in zip(batch, translated_texts):
                     if translated is not None and isinstance(translated, str):
                         fixed_translation = self.fix_first_person_translation(item["clean_text"], translated)
+                        fixed_translation = self.repair_ass_escapes(item["clean_text"], fixed_translation)
+                        if self.has_internal_ass_tokens(fixed_translation):
+                            item["translated_text"] = item["clean_text"]
+                            print(f"   ⚠️ Linha {item['index']} manteve token interno, usando original")
+                            self.stats["failed"] += 1
+                            continue
+
                         item["translated_text"] = fixed_translation
                         if self.config["enable_cache"] and item["text_hash"]:
                             self.cache[item["text_hash"]] = fixed_translation
@@ -422,15 +495,20 @@ class FixedASSTranslator:
             if "linked_to" in line:
                 original = next((l for l in lines if l["index"] == line["linked_to"]), None)
                 if original and original.get("translated_text"):
-                    line["translated_text"] = self.fix_first_person_translation(
+                    linked_translation = self.fix_first_person_translation(
                         line.get("clean_text", ""),
                         original["translated_text"],
+                    )
+                    line["translated_text"] = self.repair_ass_escapes(
+                        line.get("clean_text", ""),
+                        linked_translation,
                     )
             elif line.get("cached_translation"):
                 fixed_cached = self.fix_first_person_translation(
                     line.get("clean_text", ""),
                     line["cached_translation"],
                 )
+                fixed_cached = self.repair_ass_escapes(line.get("clean_text", ""), fixed_cached)
                 line["translated_text"] = fixed_cached
                 if (
                     self.config["enable_cache"]
