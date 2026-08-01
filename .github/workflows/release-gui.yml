@@ -13,12 +13,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -84,7 +84,7 @@ jobs:
 
       - name: Get latest release tag
         id: latest_release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             try {
@@ -180,7 +180,7 @@ jobs:
           Set-Content -LiteralPath "release_notes.md" -Value $notes -Encoding UTF8
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.artifact_meta.outputs.tag }}
           name: ${{ steps.artifact_meta.outputs.release_name }}
