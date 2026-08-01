@@ -1,0 +1,14 @@
+1
+00:00:01,000 --> 00:00:03,250
+<i>Hello, world.</i>
+- How are you?
+
+2
+00:00:04,500 --> 00:00:07,000
+{\an8}<font color="#ffcc00">I am here.</font>
+- Yes.
+- No!
+
+3
+00:00:08,000 --> 00:00:09,750
+Visit https://example.com/path?q=1.
