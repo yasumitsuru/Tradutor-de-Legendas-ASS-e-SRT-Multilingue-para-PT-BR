@@ -125,7 +125,11 @@ def test_ass_round_trip_preserves_styles_comments_and_commands(tmp_path: Path) -
     assert reloaded.styles.keys() == subs.styles.keys()
     assert reloaded.events[0].start == subs.events[0].start
     assert reloaded.events[0].end == subs.events[0].end
-    assert reloaded.events[0].text == r"{\an8}<i>Eu estou aqui</i>\N- Você está pronto?"
+    assert reloaded.events[0].text == r"{\an8}{\i1}Eu estou aqui{\i0}\N- Você está pronto?"
+    assert reloaded.events[0].marginl == 12
+    assert reloaded.events[0].marginr == 14
+    assert reloaded.events[0].marginv == 16
+    assert reloaded.events[0].effect == "fade"
     assert reloaded.events[1].type == "Comment"
     assert reloaded.events[1].text == "Translator note"
     assert reloaded.events[2].text == r"Wait\hfor me."
