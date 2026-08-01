@@ -9,6 +9,7 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -25,35 +26,61 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install -r requirements.txt
 
-      - name: Build GUI executable
+      - name: Build Web GUI executable
         shell: pwsh
         run: |
           ./build_gui_exe.bat
+
+      - name: Build Flet executable
+        shell: pwsh
+        run: |
+          ./build_flet_exe.bat
+
+      - name: Build PySide6 executable
+        shell: pwsh
+        run: |
+          ./build_pyside_exe.bat
 
       - name: Prepare release artifacts
         id: artifact_meta
         shell: pwsh
         run: |
-          $exePath = "dist/TradutorASS-GUI/TradutorASS-GUI.exe"
-          if (-not (Test-Path -LiteralPath $exePath)) {
-            throw "Executavel nao encontrado em: $exePath"
+          $webExePath = "dist/TradutorASS-GUI/TradutorASS-GUI.exe"
+          $fletExePath = "dist_flet/TradutorASS-Flet.exe"
+          $pysideExePath = "dist_pyside/TradutorASS-PySide.exe"
+
+          foreach ($artifactPath in @($webExePath, $fletExePath, $pysideExePath)) {
+            if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+              throw "Artefato nao encontrado em: $artifactPath"
+            }
           }
 
-          $hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLower()
-          $tag = "gui-v$(Get-Date -Format 'yyyy.MM.dd-HHmm')-${{ github.run_number }}"
-          $releaseName = "GUI Release $(Get-Date -Format 'yyyy-MM-dd HH:mm') #${{ github.run_number }}"
-          $zipPath = "TradutorASS-GUI-$tag.zip"
+          $tag = "desktop-v$(Get-Date -Format 'yyyy.MM.dd-HHmm')-${{ github.run_number }}"
+          $releaseName = "Desktop Release $(Get-Date -Format 'yyyy-MM-dd HH:mm') #${{ github.run_number }}"
+          $webZipPath = "TradutorASS-Web-$tag.zip"
+          $checksumPath = "TradutorASS-$tag.sha256"
 
-          Compress-Archive -Path "dist/TradutorASS-GUI/*" -DestinationPath $zipPath -Force
-          Set-Content -LiteralPath "TradutorASS-GUI.sha256" -Value "$hash  TradutorASS-GUI.exe" -Encoding ascii
+          Compress-Archive -Path "dist/TradutorASS-GUI/*" -DestinationPath $webZipPath -Force
 
-          "exe_hash=$hash" >> $env:GITHUB_OUTPUT
+          $webZipHash = (Get-FileHash -LiteralPath $webZipPath -Algorithm SHA256).Hash.ToLower()
+          $fletHash = (Get-FileHash -LiteralPath $fletExePath -Algorithm SHA256).Hash.ToLower()
+          $pysideHash = (Get-FileHash -LiteralPath $pysideExePath -Algorithm SHA256).Hash.ToLower()
+          $checksumLines = @(
+            "$webZipHash  $webZipPath"
+            "$fletHash  TradutorASS-Flet.exe"
+            "$pysideHash  TradutorASS-PySide.exe"
+          )
+          Set-Content -LiteralPath $checksumPath -Value $checksumLines -Encoding ascii
+
+          "web_zip_hash=$webZipHash" >> $env:GITHUB_OUTPUT
+          "flet_hash=$fletHash" >> $env:GITHUB_OUTPUT
+          "pyside_hash=$pysideHash" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "release_name=$releaseName" >> $env:GITHUB_OUTPUT
-          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "web_zip_path=$webZipPath" >> $env:GITHUB_OUTPUT
+          "checksum_path=$checksumPath" >> $env:GITHUB_OUTPUT
 
       - name: Get latest release tag
         id: latest_release
@@ -126,7 +153,9 @@ jobs:
           $summaryRemoved = Format-Section -title "Removido" -items $removed
           $summaryModified = Format-Section -title "Alterado" -items $modified
           $commitSummary = ($commitLines -join "`n")
-          $hash = "${{ steps.artifact_meta.outputs.exe_hash }}"
+          $webZipHash = "${{ steps.artifact_meta.outputs.web_zip_hash }}"
+          $fletHash = "${{ steps.artifact_meta.outputs.flet_hash }}"
+          $pysideHash = "${{ steps.artifact_meta.outputs.pyside_hash }}"
           $generatedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
 
           $notes = @"
@@ -142,8 +171,9 @@ jobs:
           $commitSummary
 
           ## Build
-          - Executavel: TradutorASS-GUI.exe
-          - SHA256: $hash
+          - Interface Web (ZIP): SHA256 $webZipHash
+          - Interface Flet (EXE): SHA256 $fletHash
+          - Interface PySide6 (EXE): SHA256 $pysideHash
           - Gerado em: $generatedAt
           "@
 
@@ -156,8 +186,9 @@ jobs:
           name: ${{ steps.artifact_meta.outputs.release_name }}
           body_path: release_notes.md
           files: |
-            ${{ steps.artifact_meta.outputs.zip_path }}
-            dist/TradutorASS-GUI/TradutorASS-GUI.exe
-            TradutorASS-GUI.sha256
+            ${{ steps.artifact_meta.outputs.web_zip_path }}
+            dist_flet/TradutorASS-Flet.exe
+            dist_pyside/TradutorASS-PySide.exe
+            ${{ steps.artifact_meta.outputs.checksum_path }}
           draft: false
           prerelease: false

@@ -3,11 +3,15 @@ setlocal
 
 cd /d "%~dp0"
 
-echo [1/3] Limpando artefatos antigos...
-if exist build_pyside rmdir /s /q build_pyside
-if exist dist_pyside rmdir /s /q dist_pyside
+echo [1/3] Validando ambiente de build...
+python -c "import PySide6, ollama, pysubs2, PyInstaller" >nul 2>&1
+if errorlevel 1 (
+  echo [ERRO] Dependencias de build ausentes.
+  echo Execute: python -m pip install -r requirements.txt
+  exit /b 1
+)
 
-echo [2/3] Gerando pacote GUI (PySide6) - modo onefile...
+echo [2/3] Gerando executavel GUI PySide6 em modo onefile...
 python -m PyInstaller ^
   --noconfirm ^
   --clean ^

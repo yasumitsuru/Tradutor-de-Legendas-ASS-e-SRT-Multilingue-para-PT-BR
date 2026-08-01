@@ -7,6 +7,9 @@ tqdm>=4.66
 # Interface grafica desktop e empacotador Flet
 flet[desktop,cli]>=0.86,<0.87
 
+# Interface grafica desktop alternativa
+PySide6>=6.8,<7
+
 # Dependencia de build (gera o .exe autonomo via build_flet_exe.bat)
 pyinstaller>=6.0
 
