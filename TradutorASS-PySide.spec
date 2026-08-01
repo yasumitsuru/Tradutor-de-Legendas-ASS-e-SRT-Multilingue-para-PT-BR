@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-import sys, os
-from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+import os
+import sys
+
+from PyInstaller.utils.hooks import collect_submodules
 
 datas = []
 binaries = []
@@ -12,10 +14,14 @@ hiddenimports += collect_submodules('PySide6.QtGui')
 hiddenimports += collect_submodules('PySide6.QtWidgets')
 hiddenimports += ['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets']
 
-# Explicitly include Python runtime DLL (fixes python314.dll not found on Windows)
-python_dll = os.path.join(os.path.dirname(sys.executable), 'python314.dll')
-if os.path.exists(python_dll):
-    binaries.append((python_dll, '.'))
+# Inclui a DLL do runtime sem fixar uma versao especifica do Python.
+python_dll_name = f'python{sys.version_info.major}{sys.version_info.minor}.dll'
+python_dll_dirs = (os.path.dirname(sys.executable), sys.base_prefix)
+for python_dll_dir in python_dll_dirs:
+    python_dll = os.path.join(python_dll_dir, python_dll_name)
+    if os.path.exists(python_dll):
+        binaries.append((python_dll, '.'))
+        break
 
 
 a = Analysis(
@@ -36,8 +42,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='TradutorASS-PySide',
     debug=False,
     bootloader_ignore_signals=False,
@@ -49,13 +56,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='TradutorASS-PySide',
 )
