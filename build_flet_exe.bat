@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 
 echo [1/3] Validando ambiente de build...
-python -c "import flet, ollama, pysubs2, PyInstaller" >nul 2>&1
+python -c "import flet, ollama, pysubs2, PyInstaller, subtitle_formats, translation_engine" >nul 2>&1
 if errorlevel 1 (
   echo [ERRO] Dependencias de build ausentes.
   echo Execute: python -m pip install -r requirements.txt
@@ -17,8 +17,10 @@ python -m flet.cli pack ^
   --name TradutorASS-Flet ^
   --distpath dist_flet ^
   --hidden-import translate_ass_fast ^
-  --product-name "Tradutor ASS - Portugues Brasil" ^
-  --file-description "Tradutor de legendas ASS com Ollama" ^
+  --hidden-import translation_engine ^
+  --hidden-import subtitle_formats ^
+  --product-name "Tradutor ASS-SRT - Portugues Brasil" ^
+  --file-description "Tradutor de legendas ASS e SRT com Ollama" ^
   --product-version 1.0.0 ^
   --file-version 1.0.0.0 ^
   --company-name "Yasu" ^

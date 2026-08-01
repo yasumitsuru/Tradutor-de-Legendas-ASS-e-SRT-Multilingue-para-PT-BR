@@ -18,6 +18,8 @@ python -m PyInstaller ^
   --add-data "templates;templates" ^
   --add-data "static;static" ^
   --hidden-import translate_ass_fast ^
+  --hidden-import translation_engine ^
+  --hidden-import subtitle_formats ^
   web_app.py
 
 if errorlevel 1 (

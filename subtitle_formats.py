@@ -26,9 +26,14 @@ _ITEM_ARTIFACT_RE = re.compile(r"<<<\s*(?:END_)?ITEM_\d+\s*>>>", re.IGNORECASE)
 _INTERNAL_PLACEHOLDER_RE = re.compile(
     r"\[{1,3}\s*(?:ASS|SRT)_[A-Z0-9_-]+\s*\]{1,3}", re.IGNORECASE
 )
+_BARE_INTERNAL_ARTIFACT_RE = re.compile(
+    r"(?:ASS_(?:BR|NBSP|TAG|LB|PREFIX)|SRT_(?:TAG|LB|PREFIX|SOURCE)|(?:END_)?ITEM_\d+)",
+    re.IGNORECASE,
+)
 _ASS_COMMAND_RE = re.compile(r"\{\\[^}\r\n]+\}|\\[Nnh]")
 _DIALOGUE_PREFIX_RE = re.compile(r"^([ \t]*-[ \t]+)")
 _SRT_RAW_MARKUP_RE = re.compile(r"<[^>\r\n]+>|\{[^}\r\n]*\}")
+_SIMPLE_HTML_TAG_RE = re.compile(r"<\s*(/?)\s*(i|b|u|font)\b[^>]*>", re.IGNORECASE)
 _PROTECTED_CONTENT_PATTERN = (
     r"https?://[^\s<>]+|"
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|"
@@ -110,7 +115,13 @@ def count_subtitle_formats(paths: Iterable[Path]) -> dict[str, int]:
 def assert_no_internal_artifacts(text: str) -> None:
     """Reject control markers that must never reach a saved subtitle."""
 
-    if _ITEM_ARTIFACT_RE.search(text) or _INTERNAL_PLACEHOLDER_RE.search(text):
+    if (
+        "[[[" in text
+        or "]]]" in text
+        or _ITEM_ARTIFACT_RE.search(text)
+        or _INTERNAL_PLACEHOLDER_RE.search(text)
+        or _BARE_INTERNAL_ARTIFACT_RE.search(text)
+    ):
         raise SubtitleValidationError("A resposta contém marcadores internos de controle.")
 
 
@@ -126,6 +137,12 @@ def _read_text_with_fallback(path: Path) -> str:
             decoding_errors.append(f"{encoding}: {exc}")
     details = "; ".join(decoding_errors)
     raise SubtitleFormatError(f"Não foi possível decodificar {path.name}: {details}")
+
+
+def _normalize_newlines(content: str) -> str:
+    """Match Python's universal-newline behavior before handing text to pysubs2."""
+
+    return content.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -185,7 +202,7 @@ class SubtitleFormatHandler(ABC):
             raise SubtitleFormatError(
                 f"O handler {self.format_name.upper()} não aceita {source.suffix or 'sem extensão'}."
             )
-        content = _read_text_with_fallback(source)
+        content = _normalize_newlines(_read_text_with_fallback(source))
         try:
             return pysubs2.SSAFile.from_string(content, format_=self.format_name)
         except Exception as exc:
@@ -195,12 +212,21 @@ class SubtitleFormatHandler(ABC):
         """Serialize atomically using UTF-8."""
 
         destination = Path(path)
+        self.validate_document(subs)
         try:
             content = subs.to_string(self.format_name)
         except Exception as exc:
             raise SubtitleFormatError(f"Falha ao serializar {destination.name}: {exc}") from exc
         assert_no_internal_artifacts(content)
         _atomic_write_text(destination, content)
+
+    def validate_document(self, subs: pysubs2.SSAFile) -> None:
+        """Validate timing and control artifacts before serialization."""
+
+        for index, event in enumerate(subs.events, start=1):
+            if event.end < event.start:
+                raise SubtitleValidationError(f"O evento {index} possui horário final inválido.")
+            assert_no_internal_artifacts(event.text)
 
     def prepare_text(self, text: str) -> PreparedSubtitleText:
         """Protect formatting, line structure, and dialogue prefixes for the model."""
@@ -290,6 +316,10 @@ class SubtitleFormatHandler(ABC):
         if remaining_tokens or _ITEM_ARTIFACT_RE.search(normalized):
             raise SubtitleValidationError("A tradução contém marcadores internos desconhecidos.")
 
+        marker_positions = [normalized.index(marker.token) for marker in prepared.markers]
+        if marker_positions != sorted(marker_positions):
+            raise SubtitleValidationError("A tradução alterou a ordem das marcações protegidas.")
+
         # Raw ASS commands in a model response are always invented: legitimate source
         # commands were replaced with protected tokens above.
         if _ASS_COMMAND_RE.search(normalized):
@@ -369,13 +399,33 @@ class SRTFormatHandler(SubtitleFormatHandler):
         rf"{_PROTECTED_CONTENT_PATTERN}|<[^>\r\n]+>|\{{[^}}\r\n]*\}}|\\[Nn]|\r\n|\r|\n"
     )
 
+    def validate_document(self, subs: pysubs2.SSAFile) -> None:
+        super().validate_document(subs)
+        for index, event in enumerate(subs.events, start=1):
+            stack: list[str] = []
+            for match in _SIMPLE_HTML_TAG_RE.finditer(event.text):
+                closing = bool(match.group(1))
+                tag_name = match.group(2).lower()
+                if closing:
+                    if not stack or stack[-1] != tag_name:
+                        raise SubtitleValidationError(
+                            f"O evento SRT {index} possui fechamento HTML incompatível: {match.group(0)}"
+                        )
+                    stack.pop()
+                else:
+                    stack.append(tag_name)
+            if stack:
+                raise SubtitleValidationError(
+                    f"O evento SRT {index} possui tag(s) HTML sem fechamento: {', '.join(stack)}"
+                )
+
     def load(self, path: str | Path) -> pysubs2.SSAFile:
         source = Path(path)
         if source.suffix.lower() != self.extension:
             raise SubtitleFormatError(
                 f"O handler SRT não aceita {source.suffix or 'sem extensão'}."
             )
-        content = _read_text_with_fallback(source)
+        content = _normalize_newlines(_read_text_with_fallback(source))
         protected, replacements = _replace_with_tokens(content, _SRT_RAW_MARKUP_RE, "SRT_SOURCE")
         try:
             subs = pysubs2.SSAFile.from_string(protected, format_="srt")
@@ -387,6 +437,7 @@ class SRTFormatHandler(SubtitleFormatHandler):
 
     def save(self, subs: pysubs2.SSAFile, path: str | Path) -> None:
         destination = Path(path)
+        self.validate_document(subs)
         serializable = copy.deepcopy(subs)
         replacements: dict[str, str] = {}
 

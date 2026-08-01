@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import pysubs2
 
 from subtitle_formats import (
     ASSFormatHandler,
@@ -58,6 +59,77 @@ def test_srt_round_trip_preserves_timing_order_text_and_markup(tmp_path: Path) -
     assert "SRT_SOURCE_" not in raw_output
 
 
+@pytest.mark.parametrize(
+    ("newline", "with_bom"),
+    [("\n", False), ("\r\n", False), ("\n", True), ("\r\n", True)],
+)
+def test_srt_loads_lf_crlf_and_utf8_bom(
+    tmp_path: Path, newline: str, with_bom: bool
+) -> None:
+    content = newline.join(
+        [
+            "1",
+            "00:00:01,000 --> 00:00:02,000",
+            "Olá.",
+            "",
+            "2",
+            "00:00:03,000 --> 00:00:04,000",
+            "- First line",
+            "- Second line",
+            "",
+        ]
+    )
+    payload = content.encode("utf-8")
+    if with_bom:
+        payload = b"\xef\xbb\xbf" + payload
+    source = tmp_path / "Episode's Test.SRT"
+    source.write_bytes(payload)
+
+    subs = SRTFormatHandler().load(source)
+
+    assert len(subs.events) == 2
+    assert subs.events[0].text == "Olá."
+    assert subs.events[1].text == r"- First line\N- Second line"
+
+
+def test_srt_preserves_empty_and_unusual_blocks(tmp_path: Path) -> None:
+    source = tmp_path / "unusual.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n[MUSIC] ♪\n\n",
+        encoding="utf-8",
+    )
+    handler = SRTFormatHandler()
+    loaded = handler.load(source)
+    destination = tmp_path / "unusual.pt.srt"
+    handler.save(loaded, destination)
+    reloaded = handler.load(destination)
+
+    assert len(reloaded.events) == 2
+    assert reloaded.events[0].text == ""
+    assert reloaded.events[1].text == "[MUSIC] ♪"
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        "<i>Hello</i>",
+        "<b>Hello</b>",
+        "<u>Hello</u>",
+        '<font color="#FF0000">Hello</font>',
+        "<i><b>Hello</b></i>",
+    ],
+)
+def test_srt_supported_html_markup_keeps_exact_position(markup: str) -> None:
+    handler = SRTFormatHandler()
+    prepared = handler.prepare_text(markup)
+
+    restored = handler.restore_text(prepared, prepared.model_text.replace("Hello", "Olá"))
+
+    assert restored == markup.replace("Hello", "Olá")
+    assert "<" not in prepared.model_text
+
+
 def test_srt_protection_restores_tags_breaks_and_dialogue_hyphens() -> None:
     handler = SRTFormatHandler()
     source = r'{\an8}<i>Hello.</i>\N- How are you?'
@@ -109,6 +181,31 @@ def test_srt_validation_rejects_damaged_or_invented_structure(mutator) -> None:
         handler.restore_text(prepared, mutator(prepared.model_text))
 
 
+def test_srt_validation_rejects_reordered_markers() -> None:
+    handler = SRTFormatHandler()
+    prepared = handler.prepare_text("<i>Hello</i>")
+    first, second = prepared.markers
+    reordered = prepared.model_text.replace(first.token, "TEMP", 1).replace(
+        second.token, first.token, 1
+    ).replace("TEMP", second.token, 1)
+
+    with pytest.raises(SubtitleValidationError, match="ordem"):
+        handler.restore_text(prepared, reordered)
+
+
+def test_srt_save_rejects_invalid_timing_and_broken_simple_html(tmp_path: Path) -> None:
+    handler = SRTFormatHandler()
+    invalid_timing = pysubs2.SSAFile()
+    invalid_timing.append(pysubs2.SSAEvent(start=2000, end=1000, text="Hello"))
+    with pytest.raises(SubtitleValidationError, match="horário final"):
+        handler.save(invalid_timing, tmp_path / "invalid-time.srt")
+
+    broken_html = pysubs2.SSAFile()
+    broken_html.append(pysubs2.SSAEvent(start=1000, end=2000, text="<i>Hello"))
+    with pytest.raises(SubtitleValidationError, match="sem fechamento"):
+        handler.save(broken_html, tmp_path / "invalid-html.srt")
+
+
 def test_ass_round_trip_preserves_styles_comments_and_commands(tmp_path: Path) -> None:
     handler = ASSFormatHandler()
     subs = handler.load(FIXTURES / "sample.ass")
@@ -139,6 +236,9 @@ def test_internal_artifacts_are_never_accepted() -> None:
     for artifact in (
         "[[[SRT_TAG_0001]]]",
         "[[ASS_LB_1]]",
+        "SRT_TAG_0001",
+        "ASS_NBSP",
+        "ITEM_0001",
         "<<<ITEM_0001>>>",
         "<<<END_ITEM_0001>>>",
     ):

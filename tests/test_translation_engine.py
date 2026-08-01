@@ -147,6 +147,30 @@ def test_batch_retries_only_the_missing_item(tmp_path: Path) -> None:
     assert "<<<ITEM_0002>>>" in client.prompts[1]
 
 
+def test_permanently_missing_item_falls_back_without_losing_valid_item(tmp_path: Path) -> None:
+    class AlwaysMissingSecondOllama:
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            first = ITEM_BLOCK_RE.search(prompt)
+            if first is None or first.group(1) != "0001":
+                return {"response": ""}
+            return {
+                "response": "<<<ITEM_0001>>>\nPrimeiro traduzido\n<<<END_ITEM_0001>>>"
+            }
+
+    handler = SRTFormatHandler()
+    prepared = [handler.prepare_text("First"), handler.prepare_text("Second")]
+    translator = FixedASSTranslator(
+        translator_config(tmp_path), AlwaysMissingSecondOllama()
+    )
+
+    outcomes = asyncio.run(translator.translate_single_batch(prepared, handler, 1, 1))
+
+    assert outcomes[0].text == "Primeiro traduzido"
+    assert not outcomes[0].used_fallback
+    assert outcomes[1].text == "Second"
+    assert outcomes[1].used_fallback
+
+
 @pytest.mark.parametrize(
     "bad_body",
     [

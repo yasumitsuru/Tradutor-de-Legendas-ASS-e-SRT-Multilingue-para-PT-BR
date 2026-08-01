@@ -19,6 +19,7 @@ import time
 from typing import Any
 from urllib import parse as urlparse
 from urllib import request as urlrequest
+from urllib import error as urlerror
 
 import ollama
 from flask import (
@@ -759,8 +760,9 @@ def _latest_commit_date_label() -> str:
             _commit_date_cache["value"] = label
             _commit_date_cache["expires_at"] = now + 120.0
             return label
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError):
+        # Git metadata is optional; the GitHub/date fallback below remains authoritative.
+        result = None
 
     github_label = _latest_commit_date_from_github_label()
     if github_label:
@@ -1193,9 +1195,9 @@ def _wait_for_server_ready(timeout_seconds: float = 12.0) -> bool:
         try:
             with urlrequest.urlopen(APP_URL, timeout=1.0):
                 return True
-        except Exception:
-            pass
-        threading.Event().wait(0.2)
+        except (OSError, urlerror.URLError):
+            threading.Event().wait(0.2)
+            continue
     return False
 
 
@@ -1256,8 +1258,8 @@ def _open_ui_on_start() -> None:
                     stderr=subprocess.DEVNULL,
                 )
                 return
-            except Exception:
-                pass
+            except OSError as exc:
+                _append_log(f"[WEB] Não foi possível abrir o Edge; usando navegador padrão: {exc}")
 
         webbrowser.open(APP_URL)
 
