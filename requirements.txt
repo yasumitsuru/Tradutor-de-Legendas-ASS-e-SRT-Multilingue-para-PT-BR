@@ -4,7 +4,10 @@ ollama>=0.4
 pysubs2>=1.6
 tqdm>=4.66
 
-# Dependencia de build (gera o .exe via build_gui_exe.bat)
+# Interface grafica desktop e empacotador Flet
+flet[desktop,cli]>=0.86,<0.87
+
+# Dependencia de build (gera o .exe autonomo via build_flet_exe.bat)
 pyinstaller>=6.0
 
 # Modelo de IA (Ollama)

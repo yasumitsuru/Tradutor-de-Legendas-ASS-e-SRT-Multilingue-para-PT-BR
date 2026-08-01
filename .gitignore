@@ -14,6 +14,11 @@ env/
 # Local/runtime artifacts
 build/
 dist/
+build_flet/
+dist_flet/
+TradutorASS-Flet.spec
+build_pyside/
+dist_pyside/
 _runtime/
 .pycache_tmp/
 
@@ -21,6 +26,10 @@ _runtime/
 translation_cache.json
 web_config.json
 *.log
+entrada/*
+!entrada/.gitkeep
+saida/*
+!saida/.gitkeep
 
 # Local tooling folders
 .claude/
