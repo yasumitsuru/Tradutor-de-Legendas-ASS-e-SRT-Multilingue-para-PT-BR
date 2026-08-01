@@ -32,6 +32,8 @@ from flask import (
     stream_with_context,
 )
 
+from subtitle_formats import count_subtitle_formats, is_supported_subtitle, iter_subtitle_files
+
 
 SOURCE_DIR = Path(__file__).resolve().parent
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -75,8 +77,8 @@ _PATH_SANITIZER = re.compile(
     r"(?:(?:\.\.|\.)[\\/][^\s:<>|?*\r\n]+)"       # ./entrada, ..\saida
 )
 _SEASON_TQDM_PERCENT_RE = re.compile(r"(\d{1,3})%\|")
-_TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\s+\.ass", re.IGNORECASE)
-_EPISODE_DONE_RE = re.compile(r"epis.{0,3}dio.+conclu", re.IGNORECASE)
+_TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\b", re.IGNORECASE)
+_FILE_DONE_RE = re.compile(r"Arquivo\s+(?:ASS|SRT)\s+conclu[ií]do", re.IGNORECASE)
 _BATCH_PROGRESS_RE = re.compile(r"Batch\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 
@@ -470,7 +472,7 @@ def _compute_progress(
     # 1) Prefer explicit tqdm season percentage when present.
     tqdm_percent: int | None = None
     for line in log_lines:
-        if "Processando Temporada" not in line:
+        if "Processando legendas" not in line and "Processando Temporada" not in line:
             continue
         match = _SEASON_TQDM_PERCENT_RE.search(line)
         if match:
@@ -487,7 +489,7 @@ def _compute_progress(
             return 100, "100% (concluído)"
         return percent, f"{percent}% (finalizado com erro)"
 
-    # 2) Fallback by episodes completed / total episodes.
+    # 2) Fallback by completed subtitle files / total selected files.
     total_files: int | None = None
     completed_files = 0
     for line in log_lines:
@@ -497,7 +499,7 @@ def _compute_progress(
                 total_files = int(total_match.group(1))
             except ValueError:
                 total_files = None
-        if _EPISODE_DONE_RE.search(line):
+        if _FILE_DONE_RE.search(line):
             completed_files += 1
 
     if total_files and total_files > 0:
@@ -512,7 +514,7 @@ def _compute_progress(
         suffix = ""
         if not running and return_code not in (None, 0):
             suffix = " (finalizado com erro)"
-        label = f"{percent}% ({completed_clamped}/{total_files} episódios){suffix}"
+        label = f"{percent}% ({completed_clamped}/{total_files} arquivos){suffix}"
         return percent, label
 
     # 3) Last fallback: batch progress for single-file runs.
@@ -650,11 +652,10 @@ def _build_command(form: dict[str, str]) -> list[str]:
     return cmd
 
 
-def _list_ass_files(directory: Path) -> list[str]:
-    """Lista arquivos `.ass` de uma pasta para exibição na interface web."""
-    if not directory.exists() or not directory.is_dir():
-        return []
-    return sorted(path.name for path in directory.glob("*.ass"))
+def _list_subtitle_files(directory: Path) -> list[str]:
+    """List ASS/SRT files for the web interface, case-insensitively."""
+
+    return [path.name for path in iter_subtitle_files(directory)]
 
 
 def _clear_directory_contents(directory: Path) -> int:
@@ -795,7 +796,7 @@ def favicon():
 
 @app.route("/start", methods=["POST"])
 def start_translation():
-    """Valida entrada, prepara estado e inicia a tradução assíncrona."""
+    """Valida entradas ASS/SRT, prepara estado e inicia a tradução assíncrona."""
     csrf_error = _require_csrf()
     if csrf_error:
         return csrf_error
@@ -816,20 +817,23 @@ def start_translation():
     if not config_ok:
         return jsonify({"ok": False, "error": config_error}), 400
 
+    safe_input = _safe_directory(input_dir, fallback=BASE_DIR / "entrada")
+    safe_output = _safe_directory(output_dir, fallback=BASE_DIR / "saida")
+    if not iter_subtitle_files(safe_input):
+        return jsonify(
+            {"ok": False, "error": "Adicione pelo menos um arquivo ASS ou SRT antes de iniciar."}
+        ), 400
+
     ollama_host = (
         normalized_settings["ollama_endpoint"]
         if normalized_settings["ollama_mode"] == "remote"
         else None
     )
-
     model_available, model_error = _ensure_ollama_model_available(
         normalized_settings["model"], ollama_host
     )
     if not model_available:
         return jsonify({"ok": False, "error": model_error}), 400
-
-    safe_input = _safe_directory(input_dir, fallback=BASE_DIR / "entrada")
-    safe_output = _safe_directory(output_dir, fallback=BASE_DIR / "saida")
 
     form = {
         "input_dir": str(safe_input),
@@ -876,7 +880,7 @@ def start_translation():
 
 @app.route("/upload", methods=["POST"])
 def upload_files():
-    """Recebe upload de arquivos `.ass`, valida nomes e salva na pasta de entrada."""
+    """Recebe arquivos ASS/SRT, valida nomes e salva na pasta de entrada."""
     csrf_error = _require_csrf()
     if csrf_error:
         return csrf_error
@@ -884,7 +888,9 @@ def upload_files():
     safe_input = _safe_directory(
         request.form.get("input_dir", "./entrada"), fallback=BASE_DIR / "entrada"
     )
-    uploaded_files = request.files.getlist("ass_files")
+    uploaded_files = request.files.getlist("subtitle_files")
+    if not uploaded_files:
+        uploaded_files = request.files.getlist("ass_files")  # compatibility with older clients
 
     if not uploaded_files:
         return jsonify({"ok": False, "error": "Nenhum arquivo enviado."}), 400
@@ -901,19 +907,24 @@ def upload_files():
         if not filename:
             skipped.append("(sem nome)")
             continue
-        if not filename.lower().endswith(".ass"):
+        if not is_supported_subtitle(filename):
             skipped.append(filename)
             continue
 
         destination = safe_input / filename
-        file.save(destination)
+        try:
+            file.save(destination)
+        except OSError as exc:
+            return jsonify(
+                {"ok": False, "error": f"Falha ao salvar {filename}: {exc}", "skipped": skipped}
+            ), 400
         saved.append(filename)
 
     if not saved:
         return jsonify(
             {
                 "ok": False,
-                "error": "Nenhum arquivo .ass válido foi enviado.",
+                "error": "Nenhum arquivo ASS ou SRT válido foi enviado.",
                 "skipped": skipped,
             }
         ), 400
@@ -923,20 +934,22 @@ def upload_files():
 
 @app.route("/download-output", methods=["GET"])
 def download_output():
-    """Compacta os `.ass` processados em memória e entrega um ZIP para download."""
+    """Compacta as legendas ASS/SRT processadas e entrega um ZIP."""
     output_dir = _safe_directory(
         request.args.get("output_dir", "./saida"), fallback=BASE_DIR / "saida"
     )
     if not output_dir.exists() or not output_dir.is_dir():
         return jsonify({"ok": False, "error": "Pasta de saída não encontrada."}), 404
 
-    ass_files = sorted(output_dir.glob("*.ass"))
-    if not ass_files:
-        return jsonify({"ok": False, "error": "Nenhum arquivo .ass processado encontrado."}), 404
+    subtitle_files = iter_subtitle_files(output_dir)
+    if not subtitle_files:
+        return jsonify(
+            {"ok": False, "error": "Nenhum arquivo ASS ou SRT processado encontrado."}
+        ), 404
 
     memory_file = BytesIO()
     with zipfile.ZipFile(memory_file, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in ass_files:
+        for path in subtitle_files:
             archive.write(path, arcname=path.name)
 
     memory_file.seek(0)
@@ -951,7 +964,7 @@ def download_output():
 
 @app.route("/files", methods=["GET"])
 def list_files():
-    """Retorna em JSON os arquivos `.ass` encontrados nas pastas de entrada e saída."""
+    """Retorna as legendas ASS/SRT e contagens por formato nas pastas de trabalho."""
     input_dir = _safe_directory(
         request.args.get("input_dir", "./entrada"), fallback=BASE_DIR / "entrada"
     )
@@ -959,10 +972,14 @@ def list_files():
         request.args.get("output_dir", "./saida"), fallback=BASE_DIR / "saida"
     )
 
+    input_paths = iter_subtitle_files(input_dir)
+    output_paths = iter_subtitle_files(output_dir)
     payload = {
         "ok": True,
-        "input_files": _list_ass_files(input_dir),
-        "output_files": _list_ass_files(output_dir),
+        "input_files": [path.name for path in input_paths],
+        "output_files": [path.name for path in output_paths],
+        "input_counts": count_subtitle_formats(input_paths),
+        "output_counts": count_subtitle_formats(output_paths),
     }
     return jsonify(payload)
 

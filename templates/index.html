@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Tradutor ASS Web</title>
+  <title>Tradutor ASS/SRT Web</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
   <main class="page">
     <section class="panel">
-      <h1>Tradutor de arquivos .ass do Inglês para o Português Brasil by Yasu</h1>
+      <h1>Tradutor de legendas ASS e SRT do Inglês para Português Brasil by Yasu</h1>
 
       <form id="translation-form" class="form-grid">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -17,13 +17,13 @@
 
         <div class="upload-box">
           <label>
-            Arquivos .ass (múltiplos)
-            <input type="file" id="ass-files" name="ass_files" accept=".ass" multiple>
+            Arquivos ASS/SRT (múltiplos)
+            <input type="file" id="subtitle-files" name="subtitle_files" accept=".ass,.ASS,.srt,.SRT" multiple>
           </label>
           <button id="upload-btn" type="button">Upload dos Arquivos</button>
           <p id="upload-meta" class="meta small">Nenhum upload feito.</p>
           <div class="file-list-box">
-            <p class="file-list-title">Arquivos de Entrada (.ass)</p>
+            <p class="file-list-title">Legendas de entrada (ASS/SRT)</p>
             <ul id="input-files-list" class="file-list">
               <li class="empty-item">Nenhum arquivo encontrado.</li>
             </ul>
@@ -84,7 +84,7 @@
         <button id="cleanup-btn" type="button" class="danger">Limpeza do trabalho anterior</button>
 
         <div class="file-list-box">
-          <p class="file-list-title">Arquivos Processados (.ass)</p>
+          <p class="file-list-title">Legendas processadas (ASS/SRT)</p>
           <ul id="output-files-list" class="file-list">
             <li class="empty-item">Nenhum arquivo processado.</li>
           </ul>
@@ -108,7 +108,7 @@
     </section>
   </main>
   <footer class="site-footer">
-    <p>Tradutor ASS Web • Desenvolvido por Yasu • Data do commit: {{ commit_date }}</p>
+    <p>Tradutor ASS/SRT Web • Desenvolvido por Yasu • Data do commit: {{ commit_date }}</p>
   </footer>
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
@@ -122,7 +122,7 @@
     const logBox = document.getElementById('log-box');
     const uploadBtn = document.getElementById('upload-btn');
     const uploadMeta = document.getElementById('upload-meta');
-    const filesInput = document.getElementById('ass-files');
+    const filesInput = document.getElementById('subtitle-files');
     const downloadBtn = document.getElementById('download-btn');
     const cleanupBtn = document.getElementById('cleanup-btn');
     const inputFilesList = document.getElementById('input-files-list');
@@ -351,7 +351,7 @@
     uploadBtn.addEventListener('click', async () => {
       const files = filesInput.files;
       if (!files || files.length === 0) {
-        alert('Selecione pelo menos um arquivo .ass para enviar.');
+        alert('Selecione pelo menos um arquivo ASS ou SRT para enviar.');
         return;
       }
 
@@ -362,7 +362,7 @@
       if (csrfMeta) payload.append('csrf_token', csrfMeta.value);
       payload.append('input_dir', inputDir);
       for (const file of files) {
-        payload.append('ass_files', file);
+        payload.append('subtitle_files', file);
       }
 
       uploadBtn.disabled = true;
