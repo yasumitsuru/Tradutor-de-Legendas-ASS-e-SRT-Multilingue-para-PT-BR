@@ -214,6 +214,7 @@ def test_full_mocked_ollama_srt_pipeline_preserves_structure(tmp_path: Path) -> 
     translated = SRTFormatHandler().load(destination)
     assert stats["failed"] == 0
     assert len(translated.events) == len(original.events)
+    assert translated._srt_cue_indices == original._srt_cue_indices
     assert [(event.start, event.end) for event in translated.events] == [
         (event.start, event.end) for event in original.events
     ]

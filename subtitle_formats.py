@@ -34,6 +34,9 @@ _ASS_COMMAND_RE = re.compile(r"\{\\[^}\r\n]+\}|\\[Nnh]")
 _DIALOGUE_PREFIX_RE = re.compile(r"^([ \t]*-[ \t]+)")
 _SRT_RAW_MARKUP_RE = re.compile(r"<[^>\r\n]+>|\{[^}\r\n]*\}")
 _SIMPLE_HTML_TAG_RE = re.compile(r"<\s*(/?)\s*(i|b|u|font)\b[^>]*>", re.IGNORECASE)
+_SRT_CUE_INDEX_RE = re.compile(
+    r"(?m)^[ \t]*(\d+)[ \t]*\n(?=[ \t]*\d{1,3}:\d{2}:\d{2}[,.]\d{3}[ \t]+-->)"
+)
 _PROTECTED_CONTENT_PATTERN = (
     r"https?://[^\s<>]+|"
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|"
@@ -401,6 +404,11 @@ class SRTFormatHandler(SubtitleFormatHandler):
 
     def validate_document(self, subs: pysubs2.SSAFile) -> None:
         super().validate_document(subs)
+        cue_indices = getattr(subs, "_srt_cue_indices", None)
+        if cue_indices is not None and len(cue_indices) != len(subs.events):
+            raise SubtitleValidationError(
+                "A quantidade de índices SRT não corresponde à quantidade de eventos."
+            )
         for index, event in enumerate(subs.events, start=1):
             stack: list[str] = []
             for match in _SIMPLE_HTML_TAG_RE.finditer(event.text):
@@ -426,6 +434,7 @@ class SRTFormatHandler(SubtitleFormatHandler):
                 f"O handler SRT não aceita {source.suffix or 'sem extensão'}."
             )
         content = _normalize_newlines(_read_text_with_fallback(source))
+        cue_indices = tuple(_SRT_CUE_INDEX_RE.findall(content))
         protected, replacements = _replace_with_tokens(content, _SRT_RAW_MARKUP_RE, "SRT_SOURCE")
         try:
             subs = pysubs2.SSAFile.from_string(protected, format_="srt")
@@ -433,12 +442,24 @@ class SRTFormatHandler(SubtitleFormatHandler):
             raise SubtitleFormatError(f"Falha ao carregar {source.name}: {exc}") from exc
         for event in subs.events:
             event.text = _restore_tokens(event.text, replacements)
+        if len(cue_indices) != len(subs.events):
+            raise SubtitleFormatError(
+                f"Não foi possível preservar todos os índices SRT de {source.name}: "
+                f"{len(cue_indices)} índice(s) para {len(subs.events)} evento(s)."
+            )
+        subs._srt_cue_indices = cue_indices
         return subs
 
     def save(self, subs: pysubs2.SSAFile, path: str | Path) -> None:
         destination = Path(path)
         self.validate_document(subs)
         serializable = copy.deepcopy(subs)
+        cue_indices = tuple(
+            str(index)
+            for index in getattr(
+                subs, "_srt_cue_indices", tuple(range(1, len(subs.events) + 1))
+            )
+        )
         replacements: dict[str, str] = {}
 
         for event in serializable.events:
@@ -455,6 +476,16 @@ class SRTFormatHandler(SubtitleFormatHandler):
         except Exception as exc:
             raise SubtitleFormatError(f"Falha ao serializar {destination.name}: {exc}") from exc
         content = _restore_tokens(content, replacements)
+        index_iterator = iter(cue_indices)
+
+        def restore_index(match: re.Match[str]) -> str:
+            return f"{next(index_iterator)}\n"
+
+        content, restored_index_count = _SRT_CUE_INDEX_RE.subn(restore_index, content)
+        if restored_index_count != len(cue_indices):
+            raise SubtitleValidationError(
+                "A serialização SRT alterou a quantidade de índices de blocos."
+            )
         assert_no_internal_artifacts(content)
         if r"\N" in content:
             raise SubtitleValidationError("Uma quebra interna ASS vazou para o SRT final.")

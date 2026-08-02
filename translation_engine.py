@@ -627,6 +627,11 @@ class FixedASSTranslator:
     ) -> None:
         if len(original.events) != len(rebuilt.events):
             raise SubtitleValidationError("A reconstrução alterou a quantidade de eventos.")
+        if handler.format_name == "srt":
+            original_indices = getattr(original, "_srt_cue_indices", None)
+            rebuilt_indices = getattr(rebuilt, "_srt_cue_indices", None)
+            if original_indices != rebuilt_indices:
+                raise SubtitleValidationError("A reconstrução alterou os índices dos blocos SRT.")
         for index, (source_event, output_event) in enumerate(
             zip(original.events, rebuilt.events), start=1
         ):

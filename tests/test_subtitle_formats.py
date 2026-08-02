@@ -110,6 +110,27 @@ def test_srt_preserves_empty_and_unusual_blocks(tmp_path: Path) -> None:
     assert reloaded.events[1].text == "[MUSIC] ♪"
 
 
+def test_srt_preserves_non_sequential_original_cue_indices(tmp_path: Path) -> None:
+    source = tmp_path / "indices.SRT"
+    source.write_text(
+        "007\n00:00:01,000 --> 00:00:02,000\nFirst\n\n"
+        "42\n00:00:03,000 --> 00:00:04,000\nSecond\n\n",
+        encoding="utf-8",
+    )
+    handler = SRTFormatHandler()
+    loaded = handler.load(source)
+    destination = tmp_path / "indices.pt.SRT"
+
+    handler.save(loaded, destination)
+    reloaded = handler.load(destination)
+
+    assert loaded._srt_cue_indices == ("007", "42")
+    assert reloaded._srt_cue_indices == ("007", "42")
+    raw = destination.read_text(encoding="utf-8")
+    assert raw.startswith("007\n")
+    assert "\n42\n00:00:03,000" in raw
+
+
 @pytest.mark.parametrize(
     "markup",
     [
