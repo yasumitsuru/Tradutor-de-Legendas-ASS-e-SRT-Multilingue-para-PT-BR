@@ -16,6 +16,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
+from subtitle_formats import is_supported_subtitle, iter_subtitle_files
+
 try:
     from PySide6.QtCore import (
         Qt,
@@ -101,8 +103,8 @@ _PATH_SANITIZER = re.compile(
     r"(?:(?:\.\.|\.)[\\/][^\s:<>|?*\r\n]+)"
 )
 _SEASON_TQDM_PERCENT_RE = re.compile(r"(\d{1,3})%\|")
-_TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\s+\.ass", re.IGNORECASE)
-_EPISODE_DONE_RE = re.compile(r"epis.{0,3}dio.+conclu", re.IGNORECASE)
+_TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\b", re.IGNORECASE)
+_FILE_DONE_RE = re.compile(r"Arquivo\s+(?:ASS|SRT)\s+conclu[ií]do", re.IGNORECASE)
 _BATCH_PROGRESS_RE = re.compile(r"Batch\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 
@@ -287,8 +289,8 @@ def _clear_directory_contents(directory: Path) -> int:
             elif item.is_dir():
                 shutil.rmtree(item)
                 removed += 1
-        except Exception:
-            pass
+        except OSError as exc:
+            raise OSError(f"Falha ao remover {item}: {exc}") from exc
     return removed
 
 
@@ -338,7 +340,7 @@ def _compute_progress(
 
     tqdm_percent: int | None = None
     for line in log_lines:
-        if "Processando Temporada" not in line:
+        if "Processando legendas" not in line and "Processando Temporada" not in line:
             continue
         match = _SEASON_TQDM_PERCENT_RE.search(line)
         if match:
@@ -364,7 +366,7 @@ def _compute_progress(
                 total_files = int(total_match.group(1))
             except ValueError:
                 total_files = None
-        if _EPISODE_DONE_RE.search(line):
+        if _FILE_DONE_RE.search(line):
             completed_files += 1
 
     if total_files and total_files > 0:
@@ -379,7 +381,7 @@ def _compute_progress(
         suffix = ""
         if not running and return_code not in (None, 0):
             suffix = " (finalizado com erro)"
-        label = f"{percent}% ({completed_clamped}/{total_files} episodios){suffix}"
+        label = f"{percent}% ({completed_clamped}/{total_files} arquivos){suffix}"
         return percent, label
 
     last_batch = (0, 0)
@@ -473,17 +475,14 @@ class TranslationWorker(QThread):
             self.finished_run.emit(-1)
 
     def terminate_process(self) -> None:
-        try:
-            if self._process and self._process.poll() is None:
-                self._process.terminate()
-        except Exception:
-            pass
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Tradutor de arquivos .ass - Ingles para Portugues (by Yasu)")
+        self.setWindowTitle("Tradutor de legendas ASS/SRT - Ingles para Portugues (by Yasu)")
         self.resize(1180, 760)
 
         self._worker: Optional[TranslationWorker] = None
@@ -522,7 +521,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(12)
 
-        title = QLabel("Tradutor de arquivos .ass do Ingles para o Portugues Brasil")
+        title = QLabel("Tradutor de legendas ASS/SRT do Ingles para o Portugues Brasil")
         title.setObjectName("title")
         root.addWidget(title)
 
@@ -535,12 +534,12 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
 
-        upload_group = QGroupBox("Arquivos de entrada (.ass)")
+        upload_group = QGroupBox("Legendas de entrada (ASS/SRT)")
         upload_layout = QGridLayout(upload_group)
         upload_layout.setContentsMargins(12, 14, 12, 12)
         upload_layout.setSpacing(8)
 
-        self.btn_upload = QPushButton("Selecionar arquivos .ass")
+        self.btn_upload = QPushButton("Selecionar arquivos ASS/SRT")
         self.btn_upload.setObjectName("upload")
         self.btn_upload.clicked.connect(self.on_upload_clicked)
         upload_layout.addWidget(self.btn_upload, 0, 0)
@@ -627,7 +626,7 @@ class MainWindow(QMainWindow):
         actions_row.addWidget(self.btn_stop, 1)
         left_layout.addLayout(actions_row)
 
-        left_output_group = QGroupBox("Arquivos processados (.ass)")
+        left_output_group = QGroupBox("Legendas processadas (ASS/SRT)")
         left_output_layout = QVBoxLayout(left_output_group)
         left_output_layout.setContentsMargins(12, 14, 12, 12)
         left_output_layout.setSpacing(8)
@@ -819,7 +818,10 @@ class MainWindow(QMainWindow):
 
     def on_upload_clicked(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Selecionar arquivos .ass", str(ENTRY_DIR), "Legendas ASS (*.ass)"
+            self,
+            "Selecionar arquivos ASS ou SRT",
+            str(ENTRY_DIR),
+            "Legendas suportadas (*.ass *.ASS *.srt *.SRT)",
         )
         if not files:
             return
@@ -833,7 +835,7 @@ class MainWindow(QMainWindow):
         skipped = []
         for src in files:
             path = Path(src)
-            if not path.suffix.lower() == ".ass":
+            if not is_supported_subtitle(path):
                 skipped.append(path.name)
                 continue
             try:
@@ -871,6 +873,12 @@ class MainWindow(QMainWindow):
             if self._state["running"]:
                 QMessageBox.warning(self, "Aviso", "Ja existe uma traducao em execucao.")
                 return
+
+        if not iter_subtitle_files(ENTRY_DIR):
+            QMessageBox.information(
+                self, "Nenhum arquivo", "Adicione pelo menos um arquivo ASS ou SRT antes de iniciar."
+            )
+            return
 
         form = self._collect_form()
         ok, normalized, error = _normalize_config(form)
@@ -967,13 +975,15 @@ class MainWindow(QMainWindow):
                 return
             try:
                 self._worker.terminate_process()
-            except Exception:
-                pass
+            except OSError as exc:
+                QMessageBox.warning(self, "Cancelar traducao", f"Falha ao encerrar processo: {exc}")
 
     def on_download_clicked(self) -> None:
-        ass_files = sorted(OUTPUT_DIR.glob("*.ass"))
-        if not ass_files:
-            QMessageBox.information(self, "Download", "Nenhum arquivo .ass processado encontrado.")
+        subtitle_files = iter_subtitle_files(OUTPUT_DIR)
+        if not subtitle_files:
+            QMessageBox.information(
+                self, "Download", "Nenhum arquivo ASS ou SRT processado encontrado."
+            )
             return
 
         default_name = f"arquivos_processados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -985,7 +995,7 @@ class MainWindow(QMainWindow):
 
         try:
             with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path in ass_files:
+                for path in subtitle_files:
                     archive.write(path, arcname=path.name)
             QMessageBox.information(self, "Download", f"ZIP salvo em:\n{dest}")
         except Exception as exc:
@@ -1088,7 +1098,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "Sobre",
-            "Tradutor de arquivos .ass do Ingles para o Portugues Brasil\n"
+            "Tradutor de legendas ASS/SRT do Ingles para o Portugues Brasil\n"
             "Desenvolvido por Yasu\n\n"
             "Interface grafica (PySide6) para o backend translate_ass_fast.py,\n"
             "usando modelos locais via Ollama.",
@@ -1098,10 +1108,10 @@ class MainWindow(QMainWindow):
         self.input_files_list.clear()
         self.output_files_list.clear()
         if ENTRY_DIR.exists():
-            for name in sorted(p.name for p in ENTRY_DIR.glob("*.ass")):
+            for name in (path.name for path in iter_subtitle_files(ENTRY_DIR)):
                 self.input_files_list.addItem(QListWidgetItem(name))
         if OUTPUT_DIR.exists():
-            for name in sorted(p.name for p in OUTPUT_DIR.glob("*.ass")):
+            for name in (path.name for path in iter_subtitle_files(OUTPUT_DIR)):
                 self.output_files_list.addItem(QListWidgetItem(name))
         if self.input_files_list.count() == 0:
             self.input_files_list.addItem(QListWidgetItem("Nenhum arquivo encontrado."))
@@ -1151,8 +1161,8 @@ class MainWindow(QMainWindow):
             try:
                 self._worker.requestInterruption()
                 self._worker.terminate()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                self._append_log(f"[GUI] Falha ao encerrar worker durante a saída: {exc}")
         event.accept()
 
 

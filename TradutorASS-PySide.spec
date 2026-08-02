@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 datas = []
 binaries = []
-hiddenimports = ['translate_ass_fast']
+hiddenimports = ['translate_ass_fast', 'translation_engine', 'subtitle_formats']
 
 # Collect only essential PySide6 modules (not all)
 hiddenimports += collect_submodules('PySide6.QtCore')

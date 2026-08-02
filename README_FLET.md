@@ -1,8 +1,8 @@
-# Interfaces desktop para Windows
+# Interfaces desktop ASS/SRT para Windows
 
 A interface principal está em `app_flet.py`. Ela oferece:
 
-- seleção de vários arquivos `.ass`;
+- seleção de vários arquivos `.ass` e `.srt`, sem distinção entre maiúsculas e minúsculas;
 - configuração de Ollama local ou remoto;
 - progresso, log em tempo real e cancelamento;
 - cache opcional e modo turbo;
@@ -11,7 +11,9 @@ A interface principal está em `app_flet.py`. Ela oferece:
 - layout responsivo de 800×600 até 4K, com modo compacto e rolagem automática.
 
 Uma interface alternativa baseada em PySide6 está disponível em `app_gui.py`.
-As duas interfaces usam o mesmo backend `translate_ass_fast.py`.
+As duas interfaces usam o mesmo backend `translate_ass_fast.py` e as mesmas regras de
+proteção e fallback por item. Consulte `README.md` para instalação, CLI, cache, testes,
+limitações do SRT e solução de problemas.
 
 ## Executar em desenvolvimento
 

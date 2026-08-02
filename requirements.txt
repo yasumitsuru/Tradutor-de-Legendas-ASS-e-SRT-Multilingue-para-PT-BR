@@ -13,6 +13,6 @@ PySide6>=6.8,<7
 # Dependencia de build (gera o .exe autonomo via build_flet_exe.bat)
 pyinstaller>=6.0
 
-# Modelo de IA (Ollama)
+# Modelo de IA para tradução ASS/SRT (Ollama)
 # Nao e pacote pip. Instale apos o pip install:
 # ollama pull qwen2.5:14b

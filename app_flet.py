@@ -17,8 +17,10 @@ from urllib import parse as urlparse
 
 import flet as ft
 
+from subtitle_formats import is_supported_subtitle, iter_subtitle_files
 
-APP_TITLE = "Tradutor de arquivos .ass - Inglês para Português"
+
+APP_TITLE = "Tradutor de legendas ASS/SRT - Inglês para Português"
 ACCENT = "#0F766E"
 ACCENT_DARK = "#115E59"
 BLUE = "#2563EB"
@@ -59,8 +61,8 @@ _PATH_SANITIZER = re.compile(
     r"(?:(?:\.\.|\.)[\\/][^\s:<>|?*\r\n]+)"
 )
 _SEASON_TQDM_PERCENT_RE = re.compile(r"(\d{1,3})%\|")
-_TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\s+\.ass", re.IGNORECASE)
-_EPISODE_DONE_RE = re.compile(r"epis.{0,3}dio.+conclu", re.IGNORECASE)
+_TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\b", re.IGNORECASE)
+_FILE_DONE_RE = re.compile(r"Arquivo\s+(?:ASS|SRT)\s+conclu[ií]do", re.IGNORECASE)
 _BATCH_PROGRESS_RE = re.compile(r"Batch\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 
@@ -256,7 +258,7 @@ def _compute_progress(
 
     season_percent: int | None = None
     for line in log_lines:
-        if "Processando Temporada" in line:
+        if "Processando legendas" in line or "Processando Temporada" in line:
             match = _SEASON_TQDM_PERCENT_RE.search(line)
             if match:
                 season_percent = max(0, min(100, int(match.group(1))))
@@ -273,7 +275,7 @@ def _compute_progress(
         total_match = _TOTAL_FILES_RE.search(line)
         if total_match:
             total_files = int(total_match.group(1))
-        if _EPISODE_DONE_RE.search(line):
+        if _FILE_DONE_RE.search(line):
             completed_files += 1
     if total_files:
         completed = min(completed_files, total_files)
@@ -283,7 +285,7 @@ def _compute_progress(
         if return_code == 0:
             return 100, "100% — concluído"
         suffix = " — finalizado com erro" if not running else ""
-        return percent, f"{percent}% — {completed}/{total_files} episódios{suffix}"
+        return percent, f"{percent}% — {completed}/{total_files} arquivos{suffix}"
 
     current = total = 0
     for line in log_lines:
@@ -418,7 +420,7 @@ class TranslatorFletApp:
         self.input_files = ft.ListView(height=116, spacing=2, padding=0)
         self.output_files = ft.ListView(height=105, spacing=2, padding=0)
         self.upload_meta = ft.Text(
-            "Selecione um ou mais arquivos .ass.",
+            "Selecione um ou mais arquivos ASS ou SRT.",
             size=12,
             color=MUTED,
         )
@@ -579,7 +581,7 @@ class TranslatorFletApp:
                     ft.Row(
                         [
                             ft.FilledButton(
-                                "Selecionar .ass",
+                                "Selecionar ASS/SRT",
                                 icon=ft.Icons.ADD_ROUNDED,
                                 bgcolor=ORANGE,
                                 color=ft.Colors.WHITE,
@@ -836,8 +838,8 @@ class TranslatorFletApp:
         return rows
 
     def _refresh_files(self) -> None:
-        input_paths = sorted(ENTRY_DIR.glob("*.ass"), key=lambda path: path.name.lower())
-        output_paths = sorted(OUTPUT_DIR.glob("*.ass"), key=lambda path: path.name.lower())
+        input_paths = iter_subtitle_files(ENTRY_DIR)
+        output_paths = iter_subtitle_files(OUTPUT_DIR)
         self.input_files.controls = self._file_rows(
             input_paths,
             "Nenhum arquivo na pasta de entrada.",
@@ -956,10 +958,10 @@ class TranslatorFletApp:
                 return
         try:
             selected = await self.file_picker.pick_files(
-                dialog_title="Selecionar legendas ASS",
+                dialog_title="Selecionar legendas ASS ou SRT",
                 initial_directory=str(ENTRY_DIR),
                 file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=["ass"],
+                allowed_extensions=["ass", "srt"],
                 allow_multiple=True,
             )
             if not selected:
@@ -972,7 +974,7 @@ class TranslatorFletApp:
                     skipped.append(getattr(picked, "name", "arquivo sem caminho"))
                     continue
                 source = Path(path_text)
-                if source.suffix.lower() != ".ass":
+                if not is_supported_subtitle(source):
                     skipped.append(source.name)
                     continue
                 try:
@@ -1013,8 +1015,10 @@ class TranslatorFletApp:
         if not IS_FROZEN and not SCRIPT_PATH.exists():
             self._show_message("Backend não encontrado", "translate_ass_fast.py não foi localizado.", error=True)
             return
-        if not any(ENTRY_DIR.glob("*.ass")):
-            self._show_message("Nenhum arquivo", "Adicione pelo menos um arquivo .ass antes de iniciar.")
+        if not iter_subtitle_files(ENTRY_DIR):
+            self._show_message(
+                "Nenhum arquivo", "Adicione pelo menos um arquivo ASS ou SRT antes de iniciar."
+            )
             return
         with self._lock:
             if self._running:
@@ -1165,7 +1169,7 @@ class TranslatorFletApp:
         )
 
     async def _on_download_clicked(self, _: Any) -> None:
-        files = sorted(OUTPUT_DIR.glob("*.ass"))
+        files = iter_subtitle_files(OUTPUT_DIR)
         if not files:
             self._show_message("Nenhum arquivo", "Ainda não há legendas processadas para compactar.")
             return
@@ -1293,7 +1297,7 @@ class TranslatorFletApp:
     def _on_about_clicked(self, _: Any) -> None:
         self._show_message(
             "Sobre",
-            "Tradutor de arquivos .ass do Inglês para Português do Brasil\n"
+            "Tradutor de legendas ASS/SRT do Inglês para Português do Brasil\n"
             "Interface Flet para Windows • desenvolvido por Yasu\n\n"
             "O executável inclui Python, Flet e as bibliotecas do projeto. "
             "O Ollama e o modelo escolhido devem estar disponíveis localmente ou pela rede.",
@@ -1305,8 +1309,8 @@ class TranslatorFletApp:
         if process and process.poll() is None:
             try:
                 process.terminate()
-            except Exception:
-                pass
+            except OSError as exc:
+                self._append_log(f"[FLET] Falha ao encerrar processo durante a saída: {exc}")
 
 
 def _run_backend() -> int:

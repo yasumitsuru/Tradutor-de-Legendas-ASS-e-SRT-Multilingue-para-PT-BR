@@ -6,7 +6,7 @@ cls
 set "MODEL=qwen2.5:14b"
 
 echo ============================================================
-echo   PIPELINE DE TRADUCAO - MODO DIRETO
+echo   PIPELINE DE TRADUCAO ASS/SRT - MODO DIRETO
 echo ============================================================
 echo.
 
