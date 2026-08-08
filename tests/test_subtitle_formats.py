@@ -276,6 +276,29 @@ def test_ass_text_comments_are_removed_without_losing_real_overrides(
 
 
 @pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            r"Mich mit {\i1}ihm{\i0} für einen Job zusammentun? {Team up with {\i1}{him{\i0} {for a job? Sure thing.}",
+            r"Mich mit {\i1}ihm{\i0} für einen Job zusammentun?",
+        ),
+        (
+            r"Klar doch. {Team up with {\i1}{him{\i0} {for a job? Sure thing.}",
+            "Klar doch.",
+        ),
+        (
+            r"Hallo. {English {\i1}annotation{\i0}}",
+            "Hallo.",
+        ),
+    ],
+)
+def test_ass_nested_text_comments_are_removed_as_one_comment_region(
+    source: str, expected: str
+) -> None:
+    assert sanitize_ass_text(source) == expected
+
+
+@pytest.mark.parametrize(
     "tag",
     [
         r"{\pos(100,200)}",

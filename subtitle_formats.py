@@ -222,14 +222,69 @@ def _scan_ass_override_spans(value: str) -> tuple[tuple[int, int], ...]:
     return tuple(spans)
 
 
+def _matching_ass_brace_end(value: str, start: int) -> int | None:
+    """Return the end of a brace region, accepting nested textual braces."""
+
+    depth = 0
+    for index in range(start, len(value)):
+        character = value[index]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _remove_nested_ass_text_regions(text: str) -> tuple[str, bool]:
+    """Remove whole nested comment regions before scanning flat override blocks."""
+
+    visible_end = len(text.rstrip(" \t"))
+    pieces: list[str] = []
+    cursor = 0
+    removed_terminal_region = False
+
+    while cursor < len(text):
+        region_start = text.find("{", cursor)
+        if region_start < 0:
+            pieces.append(text[cursor:])
+            break
+
+        region_end = _matching_ass_brace_end(text, region_start)
+        candidate_end = len(text) if region_end is None else region_end
+        nested_start = text.find("{", region_start + 1, candidate_end)
+        if nested_start < 0:
+            pieces.append(text[cursor : region_start + 1])
+            cursor = region_start + 1
+            continue
+
+        prefix = text[region_start + 1 : nested_start]
+        prefix_spans = _scan_ass_override_spans(prefix)
+        prefix_is_text = bool(prefix.strip()) and not _ass_spans_cover_only_commands(
+            prefix, prefix_spans
+        )
+        if not prefix_is_text:
+            pieces.append(text[cursor : region_start + 1])
+            cursor = region_start + 1
+            continue
+
+        pieces.append(text[cursor:region_start])
+        cursor = candidate_end
+        if candidate_end >= visible_end:
+            removed_terminal_region = True
+
+    return "".join(pieces), removed_terminal_region
+
+
 def sanitize_ass_text(text: str) -> str:
     """Remove textual brace comments while preserving recognized ASS overrides exactly."""
 
     if not isinstance(text, str):
         raise SubtitleValidationError("O texto ASS deve ser uma string.")
 
+    text, removed_terminal_text_block = _remove_nested_ass_text_regions(text)
     visible_end = len(text.rstrip(" \t"))
-    removed_terminal_text_block = False
 
     def sanitize_block(match: re.Match[str]) -> str:
         nonlocal removed_terminal_text_block
