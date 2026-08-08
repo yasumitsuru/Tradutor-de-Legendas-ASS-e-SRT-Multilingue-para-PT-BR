@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,11 +22,12 @@ from subtitle_formats import (
     SubtitleValidationError,
     assert_no_internal_artifacts,
     get_format_handler,
+    sanitize_ass_text,
 )
 
 
-CACHE_SCHEMA_VERSION = 2
-PROMPT_VERSION = "subtitle-items-v1"
+CACHE_SCHEMA_VERSION = 3
+PROMPT_VERSION = "subtitle-items-v2"
 ITEM_BLOCK_RE = re.compile(
     r"<<<ITEM_(\d{4})>>>[ \t]*\r?\n?(.*?)[ \t]*\r?\n?<<<END_ITEM_\1>>>",
     re.IGNORECASE | re.DOTALL,
@@ -53,6 +55,7 @@ CONFIG: dict[str, Any] = {
     "turbo_mode": False,
     "source_language": "English",
     "target_language": "Brazilian Portuguese",
+    "allow_original_fallback": False,
     "prompt_version": PROMPT_VERSION,
     "system_prompt": (
         "Traduza do inglês para português do Brasil. Produza texto natural, fluente e conciso "
@@ -66,6 +69,17 @@ CONFIG: dict[str, Any] = {
 
 class ModelUnavailableError(RuntimeError):
     """Fatal error raised when the configured model is absent from Ollama."""
+
+
+class IncompleteTranslationError(SubtitleValidationError):
+    """Raised when unresolved items make a safely completed output impossible."""
+
+    def __init__(self, failed_count: int):
+        self.failed_count = failed_count
+        super().__init__(
+            f"Falha definitiva em {failed_count} item(ns). Arquivo não será salvo como "
+            "tradução concluída para evitar mistura de idiomas."
+        )
 
 
 def is_model_not_found_error(exc: Exception) -> bool:
@@ -322,6 +336,8 @@ class FixedASSTranslator:
     ) -> bool:
         try:
             assert_no_internal_artifacts(cached)
+            if handler.format_name == "ass" and sanitize_ass_text(cached) != cached:
+                return False
             cached_prepared = handler.prepare_text(cached)
         except SubtitleValidationError:
             return False
@@ -338,7 +354,8 @@ class FixedASSTranslator:
         source = Path(input_path)
         handler = get_format_handler(source)
         print(f"📖 Carregando arquivo {handler.format_name.upper()}: {source}")
-        subs = handler.load(source)
+        loaded = handler.load(source)
+        subs = handler.prepare_document(loaded)
         lines_to_translate: list[dict[str, Any]] = []
         unique_by_hash: dict[str, dict[str, Any]] = {}
 
@@ -424,7 +441,30 @@ class FixedASSTranslator:
             f"{item_blocks}"
         )
 
-    async def _generate(self, prompt: str) -> str:
+    def _build_individual_prompt(
+        self, item_id: int, prepared: PreparedSubtitleText
+    ) -> str:
+        """Build the strict minimal prompt used for final per-item recovery."""
+
+        return (
+            f"Traduza de {self.config['source_language']} para "
+            f"{self.config['target_language']}.\n"
+            "Responda somente com o mesmo bloco ITEM, sem Markdown ou explicações. "
+            "Preserve literalmente os tokens entre colchetes triplos e não crie "
+            "tags, comandos ou quebras.\n\n"
+            f"<<<ITEM_{item_id:04d}>>>\n"
+            f"{self.normalize_first_person_source(prepared.model_text)}\n"
+            f"<<<END_ITEM_{item_id:04d}>>>"
+        )
+
+    async def _generate(
+        self, prompt: str, *, temperature: float | None = None
+    ) -> str:
+        effective_temperature = (
+            float(self.config["temperature"])
+            if temperature is None
+            else float(temperature)
+        )
         response = await asyncio.wait_for(
             asyncio.to_thread(
                 self.ollama_client.generate,
@@ -432,7 +472,7 @@ class FixedASSTranslator:
                 prompt=prompt,
                 system=self.config["system_prompt"],
                 options={
-                    "temperature": self.config["temperature"],
+                    "temperature": effective_temperature,
                     "num_predict": self.config["max_tokens"],
                     "top_p": 0.9,
                 },
@@ -464,6 +504,15 @@ class FixedASSTranslator:
         if residue:
             return parsed, "A resposta contém texto ou Markdown fora dos itens."
         return parsed, None
+
+    @staticmethod
+    def _discard_unexpected_items(
+        parsed: MutableMapping[int, str], expected_ids: Sequence[int]
+    ) -> None:
+        expected = set(expected_ids)
+        for item_id in sorted(set(parsed) - expected):
+            parsed.pop(item_id, None)
+            print(f"   ⚠️ ITEM inesperado {item_id:04d} descartado.")
 
     def _validate_model_body(
         self,
@@ -523,17 +572,15 @@ class FixedASSTranslator:
                     errors[item_id] = message
                 print(f"   ❌ {message}")
             else:
-                parsed, response_error = self._parse_item_response(response_text)
-                if response_error:
-                    print(f"   ⚠️ {response_error}")
+                parsed, response_warning = self._parse_item_response(response_text)
+                self._discard_unexpected_items(parsed, tuple(pending))
+                if response_warning:
+                    print(f"   ⚠️ {response_warning} O resíduo externo foi descartado.")
                 resolved_ids: list[int] = []
                 for item_id, prepared in pending.items():
                     body = parsed.get(item_id)
                     if body is None:
                         errors[item_id] = "Item ausente ou duplicado na resposta."
-                        continue
-                    if response_error is not None:
-                        errors[item_id] = response_error
                         continue
                     try:
                         restored = self._validate_model_body(handler, prepared, body)
@@ -547,6 +594,47 @@ class FixedASSTranslator:
 
             if pending and attempt < int(self.config["retry_count"]):
                 await asyncio.sleep(float(self.config["retry_delay"]))
+
+        if pending:
+            print(
+                f"   🛟 Recuperação individual de {len(pending)} item(ns) "
+                "com temperatura 0.0"
+            )
+        for item_id, prepared in list(pending.items()):
+            try:
+                response_text = await self._generate(
+                    self._build_individual_prompt(item_id, prepared),
+                    temperature=0.0,
+                )
+            except asyncio.TimeoutError:
+                errors[item_id] = (
+                    f"Timeout após {self.config['timeout']}s na recuperação individual."
+                )
+                continue
+            except Exception as exc:
+                if is_model_not_found_error(exc):
+                    raise ModelUnavailableError(
+                        f'❌ Modelo "{self.config["model"]}" não está disponível no Ollama. '
+                        "Encerrando para nova execução com um modelo válido."
+                    ) from exc
+                errors[item_id] = f"Erro do Ollama na recuperação individual: {exc}"
+                continue
+
+            parsed, response_warning = self._parse_item_response(response_text)
+            self._discard_unexpected_items(parsed, (item_id,))
+            if response_warning:
+                print(f"   ⚠️ {response_warning} O resíduo externo foi descartado.")
+            body = parsed.get(item_id)
+            if body is None:
+                errors[item_id] = "Item ausente ou duplicado na recuperação individual."
+                continue
+            try:
+                restored = self._validate_model_body(handler, prepared, body)
+            except SubtitleValidationError as exc:
+                errors[item_id] = str(exc)
+                continue
+            outcomes[item_id - 1] = TranslationOutcome(restored)
+            pending.pop(item_id, None)
 
         for item_id, prepared in pending.items():
             error = errors.get(item_id, "Falha de tradução sem detalhe.")
@@ -692,17 +780,29 @@ class FixedASSTranslator:
         started_at = datetime.now()
         subs, lines, handler = self.parse_subtitle_file(source)
         translated_lines = await self.process_lines_optimized(lines, handler) if lines else lines
+        if self.stats["failed"] and not bool(self.config["allow_original_fallback"]):
+            print(
+                f"❌ Falha definitiva em {self.stats['failed']} item(ns). "
+                f"Nenhum novo output foi produzido para {source.name}."
+            )
+            raise IncompleteTranslationError(self.stats["failed"])
         translations = {
             line["index"]: line.get("translated_text", line["original_text"])
             for line in translated_lines
         }
         rebuilt = handler.rebuild(subs, translations)
         self._validate_rebuilt_document(subs, rebuilt, handler)
-        handler.save(rebuilt, destination)
-
-        # Reopen the exact serialized output to catch format-specific conversion leaks.
-        saved = handler.load(destination)
-        self._validate_rebuilt_document(rebuilt, saved, handler)
+        candidate = destination.with_name(
+            f".{destination.stem}.{uuid.uuid4().hex}.candidate{destination.suffix}"
+        )
+        try:
+            handler.save(rebuilt, candidate)
+            # Validate the exact serialization before atomically publishing it.
+            saved = handler.load(candidate)
+            self._validate_rebuilt_document(rebuilt, saved, handler)
+            candidate.replace(destination)
+        finally:
+            candidate.unlink(missing_ok=True)
 
         elapsed = max((datetime.now() - started_at).total_seconds(), 0.001)
         print(f"\n✅ Arquivo {handler.format_name.upper()} concluído: {source.name}")

@@ -33,6 +33,7 @@ from flask import (
     stream_with_context,
 )
 
+from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import count_subtitle_formats, is_supported_subtitle, iter_subtitle_files
 
 
@@ -81,6 +82,10 @@ _SEASON_TQDM_PERCENT_RE = re.compile(r"(\d{1,3})%\|")
 _TOTAL_FILES_RE = re.compile(r"Encontrados\s+(\d+)\s+arquivos\b", re.IGNORECASE)
 _FILE_DONE_RE = re.compile(r"Arquivo\s+(?:ASS|SRT)\s+conclu[ií]do", re.IGNORECASE)
 _BATCH_PROGRESS_RE = re.compile(r"Batch\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+
+
+def _run_manifest_path() -> Path:
+    return BASE_DIR / ".translation_run_outputs.json"
 
 
 def _sanitize_logs(text: str) -> str:
@@ -649,6 +654,9 @@ def _build_command(form: dict[str, str]) -> list[str]:
         cmd.append("--clear-cache")
     if form.get("no_cache") == "on":
         cmd.append("--no-cache")
+    if form.get("allow_original_fallback") == "on":
+        cmd.append("--allow-original-fallback")
+    cmd.extend(["--result-manifest", str(_run_manifest_path())])
 
     return cmd
 
@@ -848,12 +856,19 @@ def start_translation():
         "turbo": request.form.get("turbo", "off"),
         "clear_cache": request.form.get("clear_cache", "off"),
         "no_cache": request.form.get("no_cache", "off"),
+        "allow_original_fallback": request.form.get(
+            "allow_original_fallback", "off"
+        ),
     }
 
     with _state_lock:
         if _state["running"]:
             return jsonify({"ok": False, "error": "Já existe uma tradução em execução."}), 409
 
+    try:
+        initialize_run_manifest(_run_manifest_path())
+    except OSError as exc:
+        return jsonify({"ok": False, "error": f"Falha ao iniciar manifesto da execução: {exc}"}), 500
     cmd = _build_command(form)
 
     with _state_lock:
@@ -943,10 +958,10 @@ def download_output():
     if not output_dir.exists() or not output_dir.is_dir():
         return jsonify({"ok": False, "error": "Pasta de saída não encontrada."}), 404
 
-    subtitle_files = iter_subtitle_files(output_dir)
+    subtitle_files = load_run_outputs(_run_manifest_path(), output_dir)
     if not subtitle_files:
         return jsonify(
-            {"ok": False, "error": "Nenhum arquivo ASS ou SRT processado encontrado."}
+            {"ok": False, "error": "Nenhum arquivo produzido na execução atual."}
         ), 404
 
     memory_file = BytesIO()
@@ -975,7 +990,7 @@ def list_files():
     )
 
     input_paths = iter_subtitle_files(input_dir)
-    output_paths = iter_subtitle_files(output_dir)
+    output_paths = load_run_outputs(_run_manifest_path(), output_dir)
     payload = {
         "ok": True,
         "input_files": [path.name for path in input_paths],
@@ -1007,6 +1022,7 @@ def cleanup_previous_work():
         if CACHE_PATH.exists():
             CACHE_PATH.unlink()
             cache_cleared = True
+        _run_manifest_path().unlink(missing_ok=True)
     except Exception as exc:
         return jsonify({"ok": False, "error": f"Falha ao limpar pastas: {exc}"}), 500
 

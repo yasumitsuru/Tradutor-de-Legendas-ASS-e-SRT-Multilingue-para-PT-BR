@@ -16,6 +16,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
+from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import is_supported_subtitle, iter_subtitle_files
 
 try:
@@ -96,6 +97,10 @@ DEFAULT_FORM_VALUES: dict[str, str] = {
     "ollama_endpoint": "",
 }
 CONFIG_KEYS = ("model", "batch_size", "timeout", "ollama_mode", "ollama_endpoint")
+
+
+def _run_manifest_path() -> Path:
+    return BASE_DIR / ".translation_run_outputs.json"
 
 _ALLOWED_MODEL_RE = re.compile(r"^[a-z0-9._:/@-]+$", re.IGNORECASE)
 _PATH_SANITIZER = re.compile(
@@ -322,6 +327,9 @@ def _build_command(form: dict[str, str]) -> list[str]:
         cmd.append("--clear-cache")
     if form.get("no_cache") == "on":
         cmd.append("--no-cache")
+    if form.get("allow_original_fallback") == "on":
+        cmd.append("--allow-original-fallback")
+    cmd.extend(["--result-manifest", str(_run_manifest_path())])
 
     return cmd
 
@@ -600,6 +608,18 @@ class MainWindow(QMainWindow):
         checks_row.addWidget(self.no_cache_check)
         checks_row.addStretch(1)
         config_form.addRow(checks_row)
+
+        self.allow_original_fallback_check = QCheckBox(
+            "Permitir manter texto original quando a tradução falhar"
+        )
+        self.allow_original_fallback_check.setChecked(False)
+        config_form.addRow(self.allow_original_fallback_check)
+        fallback_warning = QLabel(
+            "Atenção: isso pode gerar legendas misturando PT-BR com o idioma original."
+        )
+        fallback_warning.setWordWrap(True)
+        fallback_warning.setStyleSheet("color:#8a4b08; font-size:12px;")
+        config_form.addRow(fallback_warning)
 
         config_btns = QHBoxLayout()
         self.btn_save_config = QPushButton("Salvar Configuracao")
@@ -911,8 +931,20 @@ class MainWindow(QMainWindow):
             "turbo": "on" if self.turbo_check.isChecked() else "off",
             "clear_cache": "on" if self.clear_cache_check.isChecked() else "off",
             "no_cache": "on" if self.no_cache_check.isChecked() else "off",
+            "allow_original_fallback": (
+                "on" if self.allow_original_fallback_check.isChecked() else "off"
+            ),
         }
 
+        try:
+            initialize_run_manifest(_run_manifest_path())
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Falha ao iniciar execução",
+                f"Não foi possível criar o manifesto de outputs: {exc}",
+            )
+            return
         cmd = _build_command(full_form)
 
         with self._state_lock:
@@ -979,7 +1011,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Cancelar traducao", f"Falha ao encerrar processo: {exc}")
 
     def on_download_clicked(self) -> None:
-        subtitle_files = iter_subtitle_files(OUTPUT_DIR)
+        subtitle_files = load_run_outputs(_run_manifest_path(), OUTPUT_DIR)
         if not subtitle_files:
             QMessageBox.information(
                 self, "Download", "Nenhum arquivo ASS ou SRT processado encontrado."
@@ -1072,6 +1104,7 @@ class MainWindow(QMainWindow):
             if CACHE_PATH.exists():
                 CACHE_PATH.unlink()
                 cache_cleared = True
+            _run_manifest_path().unlink(missing_ok=True)
         except Exception as exc:
             QMessageBox.critical(self, "Erro", f"Falha ao limpar pastas: {exc}")
             return
@@ -1111,7 +1144,9 @@ class MainWindow(QMainWindow):
             for name in (path.name for path in iter_subtitle_files(ENTRY_DIR)):
                 self.input_files_list.addItem(QListWidgetItem(name))
         if OUTPUT_DIR.exists():
-            for name in (path.name for path in iter_subtitle_files(OUTPUT_DIR)):
+            for name in (
+                path.name for path in load_run_outputs(_run_manifest_path(), OUTPUT_DIR)
+            ):
                 self.output_files_list.addItem(QListWidgetItem(name))
         if self.input_files_list.count() == 0:
             self.input_files_list.addItem(QListWidgetItem("Nenhum arquivo encontrado."))

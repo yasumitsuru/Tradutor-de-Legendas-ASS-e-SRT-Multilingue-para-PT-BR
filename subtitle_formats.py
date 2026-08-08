@@ -42,6 +42,210 @@ _PROTECTED_CONTENT_PATTERN = (
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|"
     r"\$\{[^}\r\n]+\}|\{\{[^}\r\n]+\}\}|%[A-Z0-9_]+%"
 )
+_ASS_BRACE_BLOCK_RE = re.compile(r"\{([^{}\r\n]*)\}")
+_ASS_PAREN_COMMANDS = frozenset(
+    {"pos", "move", "org", "clip", "iclip", "fad", "fade", "t"}
+)
+_ASS_NUMERIC_COMMANDS = frozenset(
+    {
+        "i",
+        "b",
+        "u",
+        "s",
+        "an",
+        "a",
+        "q",
+        "p",
+        "pbo",
+        "be",
+        "blur",
+        "bord",
+        "xbord",
+        "ybord",
+        "shad",
+        "xshad",
+        "yshad",
+        "fs",
+        "fscx",
+        "fscy",
+        "fsp",
+        "fr",
+        "frx",
+        "fry",
+        "frz",
+        "fax",
+        "fay",
+        "fe",
+        "k",
+        "kf",
+        "ko",
+        "kt",
+    }
+)
+_ASS_COLOR_COMMANDS = frozenset({"c", "1c", "2c", "3c", "4c"})
+_ASS_ALPHA_COMMANDS = frozenset({"alpha", "1a", "2a", "3a", "4a"})
+_ASS_TEXT_COMMANDS = frozenset({"fn", "r"})
+_ASS_COMMAND_NAMES = tuple(
+    sorted(
+        _ASS_PAREN_COMMANDS
+        | _ASS_NUMERIC_COMMANDS
+        | _ASS_COLOR_COMMANDS
+        | _ASS_ALPHA_COMMANDS
+        | _ASS_TEXT_COMMANDS,
+        key=len,
+        reverse=True,
+    )
+)
+_ASS_NUMBER_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+_ASS_NUMBER_RE = re.compile(rf"^{_ASS_NUMBER_PATTERN}$")
+_ASS_COLOR_RE = re.compile(r"^&H[0-9A-F]+&?$", re.IGNORECASE)
+_ASS_ALPHA_RE = re.compile(r"^&H[0-9A-F]{1,2}&?$", re.IGNORECASE)
+
+
+def _scan_balanced_parentheses(value: str, start: int) -> int | None:
+    """Return the first index after a balanced parenthesized argument."""
+
+    if start >= len(value) or value[start] != "(":
+        return None
+    depth = 0
+    for index in range(start, len(value)):
+        character = value[index]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+            if depth < 0:
+                return None
+    return None
+
+
+def _is_number_list(value: str, allowed_counts: set[int]) -> bool:
+    parts = [part.strip() for part in value.split(",")]
+    return len(parts) in allowed_counts and all(_ASS_NUMBER_RE.fullmatch(part) for part in parts)
+
+
+def _ass_command_name_at(value: str, start: int) -> str | None:
+    if start >= len(value) or value[start] != "\\":
+        return None
+    remainder = value[start + 1 :].casefold()
+    return next((name for name in _ASS_COMMAND_NAMES if remainder.startswith(name)), None)
+
+
+def _ass_spans_cover_only_commands(value: str, spans: Sequence[tuple[int, int]]) -> bool:
+    cursor = 0
+    for start, end in spans:
+        if value[cursor:start].strip():
+            return False
+        cursor = end
+    return not value[cursor:].strip()
+
+
+def _valid_parenthesized_ass_argument(command: str, argument: str) -> bool:
+    inner = argument[1:-1].strip()
+    if not inner:
+        return False
+    if command in {"pos", "org"}:
+        return _is_number_list(inner, {2})
+    if command == "move":
+        return _is_number_list(inner, {4, 6})
+    if command == "fad":
+        return _is_number_list(inner, {2})
+    if command == "fade":
+        return _is_number_list(inner, {7})
+    if command in {"clip", "iclip"}:
+        return True
+    if command == "t":
+        first_override = inner.find("\\")
+        if first_override < 0:
+            return False
+        numeric_prefix = inner[:first_override]
+        if numeric_prefix and not re.fullmatch(
+            rf"(?:{_ASS_NUMBER_PATTERN}\s*,\s*){{1,3}}", numeric_prefix
+        ):
+            return False
+        modifiers = inner[first_override:]
+        spans = _scan_ass_override_spans(modifiers)
+        return bool(spans) and _ass_spans_cover_only_commands(modifiers, spans)
+    return False
+
+
+def _valid_simple_ass_argument(command: str, argument: str) -> bool:
+    stripped = argument.strip()
+    if command in _ASS_NUMERIC_COMMANDS:
+        return not stripped or bool(_ASS_NUMBER_RE.fullmatch(stripped))
+    if command in _ASS_COLOR_COMMANDS:
+        return not stripped or bool(_ASS_COLOR_RE.fullmatch(stripped))
+    if command in _ASS_ALPHA_COMMANDS:
+        return not stripped or bool(_ASS_ALPHA_RE.fullmatch(stripped))
+    if command in _ASS_TEXT_COMMANDS:
+        return "{" not in argument and "}" not in argument
+    return False
+
+
+def _parse_ass_override_at(value: str, start: int) -> int | None:
+    """Return the exact end of one recognized ASS override command."""
+
+    command = _ass_command_name_at(value, start)
+    if command is None:
+        return None
+    argument_start = start + 1 + len(command)
+    if command in _ASS_PAREN_COMMANDS:
+        command_end = _scan_balanced_parentheses(value, argument_start)
+        if command_end is None:
+            return None
+        argument = value[argument_start:command_end]
+        return command_end if _valid_parenthesized_ass_argument(command, argument) else None
+
+    next_command = value.find("\\", argument_start)
+    command_end = len(value) if next_command < 0 else next_command
+    argument = value[argument_start:command_end]
+    return command_end if _valid_simple_ass_argument(command, argument) else None
+
+
+def _scan_ass_override_spans(value: str) -> tuple[tuple[int, int], ...]:
+    """Find recognized ASS commands while leaving natural-language residue visible."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(value):
+        command_start = value.find("\\", cursor)
+        if command_start < 0:
+            break
+        command_end = _parse_ass_override_at(value, command_start)
+        if command_end is None:
+            cursor = command_start + 1
+            continue
+        spans.append((command_start, command_end))
+        cursor = command_end
+    return tuple(spans)
+
+
+def sanitize_ass_text(text: str) -> str:
+    """Remove textual brace comments while preserving recognized ASS overrides exactly."""
+
+    if not isinstance(text, str):
+        raise SubtitleValidationError("O texto ASS deve ser uma string.")
+
+    visible_end = len(text.rstrip(" \t"))
+    removed_terminal_text_block = False
+
+    def sanitize_block(match: re.Match[str]) -> str:
+        nonlocal removed_terminal_text_block
+        content = match.group(1)
+        spans = _scan_ass_override_spans(content)
+        if not spans:
+            if match.end() == visible_end:
+                removed_terminal_text_block = True
+            return ""
+        if _ass_spans_cover_only_commands(content, spans):
+            return match.group(0)
+        commands = "".join(content[start:end] for start, end in spans)
+        return f"{{{commands}}}" if commands else ""
+
+    sanitized = _ASS_BRACE_BLOCK_RE.sub(sanitize_block, text)
+    return sanitized.rstrip(" \t") if removed_terminal_text_block else sanitized
 
 
 class SubtitleFormatError(ValueError):
@@ -196,6 +400,11 @@ class SubtitleFormatHandler(ABC):
     format_name: str
     extension: str
     marker_pattern: re.Pattern[str]
+
+    def prepare_document(self, subs: pysubs2.SSAFile) -> pysubs2.SSAFile:
+        """Create the single working copy used by translation and reconstruction."""
+
+        return copy.deepcopy(subs)
 
     def load(self, path: str | Path) -> pysubs2.SSAFile:
         """Load a subtitle document while preserving all supported structure."""
@@ -391,6 +600,13 @@ class ASSFormatHandler(SubtitleFormatHandler):
     marker_pattern = re.compile(
         rf"{_PROTECTED_CONTENT_PATTERN}|\{{[^}}\r\n]*\}}|\\[Nnh]|\r\n|\r|\n"
     )
+
+    def prepare_document(self, subs: pysubs2.SSAFile) -> pysubs2.SSAFile:
+        prepared = super().prepare_document(subs)
+        for event in prepared.events:
+            if event.type != "Comment":
+                event.text = sanitize_ass_text(event.text)
+        return prepared
 
 
 class SRTFormatHandler(SubtitleFormatHandler):

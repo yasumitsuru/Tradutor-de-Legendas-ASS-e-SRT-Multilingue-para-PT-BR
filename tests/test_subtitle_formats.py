@@ -16,6 +16,7 @@ from subtitle_formats import (
     is_supported_subtitle,
     iter_subtitle_files,
     preserve_extension_output_path,
+    sanitize_ass_text,
 )
 
 
@@ -251,6 +252,84 @@ def test_ass_round_trip_preserves_styles_comments_and_commands(tmp_path: Path) -
     assert reloaded.events[1].type == "Comment"
     assert reloaded.events[1].text == "Translator note"
     assert reloaded.events[2].text == r"Wait\hfor me."
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Warte, Oogami! {Oogami! Wait, Oogami!}", "Warte, Oogami!"),
+        (r"{\i1}Hello{\i0}", r"{\i1}Hello{\i0}"),
+        (
+            r"{\i1}Der „Schlüssel“ ist im Korb,{The key is in the basket,\Nif you wouldn’t mind.\i0}",
+            r"{\i1}Der „Schlüssel“ ist im Korb,{\i0}",
+        ),
+        (
+            r"{\i1}wir verlassen uns auf dich. {The key is in the basket,\Nif you wouldn’t mind.}{wieder Fail vom Engsub}{\i0}",
+            r"{\i1}wir verlassen uns auf dich. {\i0}",
+        ),
+    ],
+)
+def test_ass_text_comments_are_removed_without_losing_real_overrides(
+    source: str, expected: str
+) -> None:
+    assert sanitize_ass_text(source) == expected
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        r"{\pos(100,200)}",
+        r"{\move(10,20,100,200)}",
+        r"{\clip(0,0,1920,1080)}",
+        r"{\t(0,500,\fs40\bord3)}",
+        r"{\fad(200,300)}",
+        r"{\fade(0,255,0,0,200,700,900)}",
+        r"{\c&HFFFFFF&}",
+        r"{\1c&HFFFFFF&}",
+        r"{\alpha&H80&}",
+    ],
+)
+def test_ass_complex_override_commands_are_preserved_exactly(tag: str) -> None:
+    assert sanitize_ass_text(f"{tag}Hello") == f"{tag}Hello"
+
+
+def test_ass_sanitizer_is_idempotent() -> None:
+    source = r"{\i1}Text {English,\Ncomment\i0}{\pos(100,200)}"
+
+    once = sanitize_ass_text(source)
+
+    assert sanitize_ass_text(once) == once
+
+
+def test_ass_sanitizer_preserves_unrelated_trailing_whitespace() -> None:
+    assert sanitize_ass_text("Visible text  ") == "Visible text  "
+
+
+def test_ass_prepare_document_sanitizes_dialogue_once_and_preserves_comments() -> None:
+    source = pysubs2.SSAFile()
+    source.append(
+        pysubs2.SSAEvent(
+            start=1000,
+            end=2000,
+            text="Hello {English annotation}",
+            type="Dialogue",
+        )
+    )
+    source.append(
+        pysubs2.SSAEvent(
+            start=2000,
+            end=3000,
+            text="Translator {note}",
+            type="Comment",
+        )
+    )
+
+    prepared = ASSFormatHandler().prepare_document(source)
+
+    assert prepared is not source
+    assert source.events[0].text == "Hello {English annotation}"
+    assert prepared.events[0].text == "Hello"
+    assert prepared.events[1].text == "Translator {note}"
 
 
 def test_internal_artifacts_are_never_accepted() -> None:

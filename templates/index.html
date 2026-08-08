@@ -79,6 +79,16 @@
           <label class="check"><input type="checkbox" name="no_cache"> Desativar cache</label>
         </div>
 
+        <div class="fallback-option">
+          <label class="check">
+            <input type="checkbox" name="allow_original_fallback">
+            Permitir manter texto original quando a tradução falhar
+          </label>
+          <p class="fallback-warning">
+            Atenção: isso pode gerar legendas misturando PT-BR com o idioma original.
+          </p>
+        </div>
+
         <button id="start-btn" type="submit">Iniciar Tradução</button>
         <button id="download-btn" type="button" class="secondary">Download Processados</button>
         <button id="cleanup-btn" type="button" class="danger">Limpeza do trabalho anterior</button>

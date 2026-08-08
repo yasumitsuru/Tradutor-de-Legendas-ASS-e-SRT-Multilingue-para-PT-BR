@@ -17,6 +17,7 @@ from urllib import parse as urlparse
 
 import flet as ft
 
+from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import is_supported_subtitle, iter_subtitle_files
 
 
@@ -54,6 +55,10 @@ DEFAULT_FORM_VALUES: dict[str, str] = {
     "ollama_endpoint": "",
 }
 CONFIG_KEYS = ("model", "batch_size", "timeout", "ollama_mode", "ollama_endpoint")
+
+
+def _run_manifest_path() -> Path:
+    return BASE_DIR / ".translation_run_outputs.json"
 
 _ALLOWED_MODEL_RE = re.compile(r"^[a-z0-9._:/@-]+$", re.IGNORECASE)
 _PATH_SANITIZER = re.compile(
@@ -245,6 +250,9 @@ def _build_command(form: dict[str, str]) -> list[str]:
         cmd.append("--clear-cache")
     if form.get("no_cache"):
         cmd.append("--no-cache")
+    if form.get("allow_original_fallback") is True:
+        cmd.append("--allow-original-fallback")
+    cmd.extend(["--result-manifest", str(_run_manifest_path())])
     return cmd
 
 
@@ -415,6 +423,15 @@ class TranslatorFletApp:
             label="Desativar cache",
             value=False,
             on_change=self._on_no_cache_change,
+        )
+        self.allow_original_fallback_check = ft.Checkbox(
+            label="Permitir manter texto original quando a tradução falhar",
+            value=False,
+        )
+        self.allow_original_fallback_warning = ft.Text(
+            "Atenção: isso pode gerar legendas misturando PT-BR com o idioma original.",
+            size=12,
+            color="#9A3412",
         )
 
         self.input_files = ft.ListView(height=116, spacing=2, padding=0)
@@ -623,6 +640,19 @@ class TranslatorFletApp:
                         wrap=True,
                         spacing=6,
                         run_spacing=0,
+                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                self.allow_original_fallback_check,
+                                self.allow_original_fallback_warning,
+                            ],
+                            spacing=2,
+                        ),
+                        bgcolor="#FFF7ED",
+                        border=ft.Border.all(1, "#F0C36A"),
+                        border_radius=10,
+                        padding=10,
                     ),
                     ft.Row(
                         [
@@ -839,7 +869,7 @@ class TranslatorFletApp:
 
     def _refresh_files(self) -> None:
         input_paths = iter_subtitle_files(ENTRY_DIR)
-        output_paths = iter_subtitle_files(OUTPUT_DIR)
+        output_paths = load_run_outputs(_run_manifest_path(), OUTPUT_DIR)
         self.input_files.controls = self._file_rows(
             input_paths,
             "Nenhum arquivo na pasta de entrada.",
@@ -1035,6 +1065,9 @@ class TranslatorFletApp:
             "turbo": bool(self.turbo_check.value),
             "clear_cache": bool(self.clear_cache_check.value),
             "no_cache": bool(self.no_cache_check.value),
+            "allow_original_fallback": bool(
+                self.allow_original_fallback_check.value
+            ),
         }
         ollama_host = normalized["ollama_endpoint"] if normalized["ollama_mode"] == "remote" else None
 
@@ -1048,6 +1081,17 @@ class TranslatorFletApp:
             self.log_view.controls = []
         self.progress.value = 0
         self.progress_label.value = "0%"
+        try:
+            initialize_run_manifest(_run_manifest_path())
+        except OSError as exc:
+            with self._lock:
+                self._running = False
+            self._show_message(
+                "Falha ao iniciar execução",
+                f"Não foi possível criar o manifesto de outputs: {exc}",
+                error=True,
+            )
+            return
         self._set_running_ui(True, "Validando")
         self._append_log("[Flet] Validando conexão e modelo no Ollama...")
         self._update_progress()
@@ -1169,7 +1213,7 @@ class TranslatorFletApp:
         )
 
     async def _on_download_clicked(self, _: Any) -> None:
-        files = iter_subtitle_files(OUTPUT_DIR)
+        files = load_run_outputs(_run_manifest_path(), OUTPUT_DIR)
         if not files:
             self._show_message("Nenhum arquivo", "Ainda não há legendas processadas para compactar.")
             return
@@ -1268,6 +1312,7 @@ class TranslatorFletApp:
                 cache_cleared = CACHE_PATH.exists()
                 if cache_cleared:
                     CACHE_PATH.unlink()
+                _run_manifest_path().unlink(missing_ok=True)
                 with self._lock:
                     self._logs = []
                     self.log_view.controls = []

@@ -16,6 +16,7 @@ from typing import Any, Sequence
 import ollama
 from tqdm import tqdm
 
+from run_manifest import initialize_run_manifest, record_run_output
 from subtitle_formats import (
     SUPPORTED_FORMATS,
     count_subtitle_formats,
@@ -126,6 +127,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--turbo", action="store_true", help="Reduz temperatura e tamanho do lote")
     parser.add_argument("--clear-cache", action="store_true", help="Limpa o cache antes de iniciar")
     parser.add_argument("--no-cache", action="store_true", help="Desativa o cache")
+    parser.add_argument(
+        "--allow-original-fallback",
+        action="store_true",
+        default=False,
+        help="Permite salvar itens que falharam mantendo o texto original",
+    )
+    parser.add_argument(
+        "--result-manifest",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -179,6 +191,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.result_manifest is not None:
+        initialize_run_manifest(args.result_manifest)
     subtitle_files = iter_subtitle_files(input_dir, args.format)
     ignored_files = _ignored_input_files(input_dir, subtitle_files)
     counts = count_subtitle_formats(subtitle_files)
@@ -211,6 +225,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         "timeout": args.timeout,
         "turbo_mode": args.turbo,
         "enable_cache": not args.no_cache,
+        "allow_original_fallback": args.allow_original_fallback,
     }
     if args.turbo:
         config["temperature"] = 0.15
@@ -237,6 +252,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
             output_file = preserve_extension_output_path(subtitle_file, output_dir)
             try:
                 stats = await translator.translate_file(subtitle_file, output_file)
+                if args.result_manifest is not None:
+                    record_run_output(args.result_manifest, output_dir, output_file)
             except ModelUnavailableError as exc:
                 print(str(exc))
                 print("⛔ Encerrando backend para nova tentativa com um modelo válido.")

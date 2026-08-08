@@ -175,6 +175,21 @@ select:focus {
   gap: 10px 14px;
 }
 
+.fallback-option {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #f0c36a;
+  border-radius: 10px;
+  background: #fff8e6;
+}
+
+.fallback-warning {
+  margin: 0;
+  color: #8a4b08;
+  font-size: 0.82rem;
+}
+
 .check {
   display: inline-flex;
   align-items: center;

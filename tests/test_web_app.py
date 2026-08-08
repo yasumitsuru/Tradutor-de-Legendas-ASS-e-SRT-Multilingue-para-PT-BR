@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import web_app
+from run_manifest import initialize_run_manifest, record_run_output
 
 
 @pytest.fixture
@@ -56,6 +57,13 @@ def test_upload_list_and_zip_support_ass_and_srt_case_insensitively(
     (output_dir / "Episode One.pt.SRT").write_text("translated srt", encoding="utf-8")
     (output_dir / "Episode Two.pt.ASS").write_text("translated ass", encoding="utf-8")
     (output_dir / "debug.log").write_text("ignored", encoding="utf-8")
+    initialize_run_manifest(web_app._run_manifest_path())
+    record_run_output(
+        web_app._run_manifest_path(), output_dir, output_dir / "Episode One.pt.SRT"
+    )
+    record_run_output(
+        web_app._run_manifest_path(), output_dir, output_dir / "Episode Two.pt.ASS"
+    )
 
     listing = web_client.get(
         "/files", query_string={"input_dir": "./entrada", "output_dir": "./saida"}
@@ -124,3 +132,47 @@ def test_web_progress_understands_generic_subtitle_logs() -> None:
 
     assert percent == 50
     assert label == "50% (1/2 arquivos)"
+
+
+def test_web_fallback_option_is_visible_unchecked_and_propagated(web_client) -> None:
+    page = web_client.get("/")
+    html = page.get_data(as_text=True)
+
+    assert 'name="allow_original_fallback"' in html
+    assert "Permitir manter texto original quando a tradução falhar" in html
+    assert "pode gerar legendas misturando PT-BR com o idioma original" in html
+    checkbox = html.split('name="allow_original_fallback"', 1)[0].rsplit("<input", 1)[1]
+    assert "checked" not in checkbox
+
+    base_form = {
+        "input_dir": "entrada",
+        "output_dir": "saida",
+        "model": "qwen2.5:14b",
+        "batch_size": "10",
+        "timeout": "60",
+    }
+    disabled = web_app._build_command({**base_form, "allow_original_fallback": "off"})
+    enabled = web_app._build_command({**base_form, "allow_original_fallback": "on"})
+
+    assert "--allow-original-fallback" not in disabled
+    assert "--allow-original-fallback" in enabled
+    assert "--result-manifest" in disabled
+
+
+def test_web_does_not_present_or_download_old_output_without_current_manifest(
+    web_client, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "saida"
+    output_dir.mkdir()
+    (output_dir / "episode.pt.ass").write_text("resultado antigo", encoding="utf-8")
+
+    listing = web_client.get(
+        "/files", query_string={"input_dir": "./entrada", "output_dir": "./saida"}
+    )
+    download = web_client.get(
+        "/download-output", query_string={"output_dir": "./saida"}
+    )
+
+    assert listing.get_json()["output_files"] == []
+    assert download.status_code == 404
+    assert "execução atual" in download.get_json()["error"]

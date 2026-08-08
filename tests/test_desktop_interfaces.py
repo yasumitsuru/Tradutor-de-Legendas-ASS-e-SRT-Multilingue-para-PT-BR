@@ -38,6 +38,7 @@ def test_desktop_commands_delegate_format_discovery_to_shared_backend(
         "turbo": "off",
         "clear_cache": "off",
         "no_cache": "off",
+        "allow_original_fallback": "off",
     }
 
     flet_command = app_flet._build_command(form)
@@ -47,6 +48,16 @@ def test_desktop_commands_delegate_format_discovery_to_shared_backend(
     assert pyside_command[pyside_command.index("--input-dir") + 1] == str(input_dir)
     assert "--format" not in flet_command
     assert "--format" not in pyside_command
+    assert "--allow-original-fallback" not in flet_command
+    assert "--allow-original-fallback" not in pyside_command
+    assert "--result-manifest" in flet_command
+    assert "--result-manifest" in pyside_command
+
+    flet_enabled = app_flet._build_command({**form, "allow_original_fallback": True})
+    pyside_enabled = app_gui._build_command({**form, "allow_original_fallback": "on"})
+
+    assert "--allow-original-fallback" in flet_enabled
+    assert "--allow-original-fallback" in pyside_enabled
 
 
 def test_desktop_sources_expose_both_file_picker_extensions() -> None:
@@ -55,5 +66,9 @@ def test_desktop_sources_expose_both_file_picker_extensions() -> None:
 
     assert 'allowed_extensions=["ass", "srt"]' in flet_source
     assert "*.ass *.ASS *.srt *.SRT" in pyside_source
-    assert 'iter_subtitle_files(OUTPUT_DIR)' in flet_source
-    assert 'iter_subtitle_files(OUTPUT_DIR)' in pyside_source
+    assert 'load_run_outputs(_run_manifest_path(), OUTPUT_DIR)' in flet_source
+    assert 'load_run_outputs(_run_manifest_path(), OUTPUT_DIR)' in pyside_source
+    assert "Permitir manter texto original quando a tradução falhar" in flet_source
+    assert "Permitir manter texto original quando a tradução falhar" in pyside_source
+    assert "pode gerar legendas misturando PT-BR com o idioma original" in flet_source
+    assert "pode gerar legendas misturando PT-BR com o idioma original" in pyside_source

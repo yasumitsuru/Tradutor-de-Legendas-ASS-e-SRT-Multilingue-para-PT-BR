@@ -6,8 +6,9 @@ formas de uso: linha de comando, interface web Flask, aplicativo Flet e aplicati
 PySide6.
 
 O pipeline preserva horários, ordem dos eventos, estrutura de linhas e marcações já
-existentes. Se uma resposta do modelo estiver incompleta ou estruturalmente insegura,
-somente o bloco afetado volta ao texto original; os demais itens válidos continuam.
+existentes. Respostas incompletas ou estruturalmente inseguras repetem somente os itens
+afetados e recebem uma última tentativa individual. Por padrão, uma falha definitiva
+impede o salvamento do arquivo para evitar legendas misturando idiomas.
 
 ## Formatos suportados
 
@@ -87,6 +88,9 @@ Opções úteis:
 - `--format all|ass|srt`: filtra o formato de entrada;
 - `--clear-cache`: remove o cache antes do processamento;
 - `--no-cache`: não lê nem grava traduções em cache;
+- `--allow-original-fallback`: permite explicitamente manter o texto original nos itens
+  que falharem definitivamente. Atenção: isso pode gerar legendas misturando PT-BR com
+  o idioma original;
 - `--turbo`: reduz temperatura e limita o lote a dez itens;
 - `--batch-size N`: define quantos blocos seguem em cada requisição;
 - `--timeout SEGUNDOS`: define o limite de cada chamada ao modelo.
@@ -127,8 +131,14 @@ python app_gui.py
 ```
 
 As duas interfaces desktop selecionam múltiplas legendas ASS/SRT, exibem entrada e
-saída, oferecem cancelamento e empacotam os resultados em ZIP. Todas chamam o mesmo
-backend e usam as mesmas validações.
+saída, oferecem cancelamento e empacotam os resultados em ZIP. Flask, Flet e PySide
+oferecem a opção desativada por padrão **Permitir manter texto original quando a
+tradução falhar**, acompanhada do aviso sobre mistura de idiomas. As interfaces apenas
+repassam essa escolha ao mesmo backend e usam as mesmas validações.
+
+Listas e downloads usam um manifesto da execução atual. Um arquivo antigo que já esteja
+na pasta de saída não é apresentado nem incluído no ZIP quando a nova execução falha
+antes de produzir e validar uma substituição.
 
 ## Preservação e validação
 
@@ -138,23 +148,36 @@ Antes da tradução, o handler do formato substitui por tokens opacos:
 - quebras de linha e espaços rígidos;
 - prefixos de diálogo, como `- `;
 - URLs, e-mails e variáveis comuns;
-- marcações entre chaves e metadados de posicionamento existentes.
+- override tags ASS reconhecidas e metadados de posicionamento existentes.
+
+Em ASS, blocos entre chaves são classificados por um scanner de comandos. Override tags
+reais, inclusive `\pos`, `\move`, `\clip`, `\t`, cores e alpha, são preservadas
+textualmente. Blocos de linguagem natural como `{English annotation}` são comentários
+textuais e são removidos antes da tradução. Em blocos mistos, o texto é descartado e
+comandos válidos necessários, como `\i0`, são preservados. `\N`, `\n` e `\h` dentro de
+um comentário misto não são promovidos a estrutura visível.
 
 O protocolo de lote usa blocos `<<<ITEM_0001>>>`/`<<<END_ITEM_0001>>>`. Cada resposta
 é validada individualmente. Marcadores ausentes, duplicados, reordenados ou deformados,
 Markdown, numeração inventada, mensagens explicativas e comandos ASS novos invalidam
-somente o item afetado. Esse item é tentado novamente e, ao esgotar as tentativas,
-permanece com o texto original.
+somente o item afetado. Texto ou Markdown fora dos delimitadores é descartado e
+registrado como warning, sem invalidar itens corretos nem entrar na legenda. Retries
+contêm somente itens ainda inválidos. Depois dos retries normais, cada item pendente tem
+uma tentativa individual com temperatura zero e a mesma validação estrutural.
+
+Se algum item continuar inválido, o modo padrão informa a quantidade de falhas e não
+publica um novo arquivo. A opção `--allow-original-fallback` (ou seu checkbox equivalente)
+habilita conscientemente o comportamento legado de copiar o original nesses itens.
 
 Antes de salvar, o projeto valida horários, quantidade de eventos, estrutura de linhas,
 ordem e contagem das marcações, tags HTML simples e ausência de placeholders internos.
-O arquivo salvo é reaberto para detectar conversões ou vazamentos específicos do
-formato.
+O candidato serializado é reaberto para detectar conversões ou vazamentos específicos
+do formato. Somente depois dessa validação ele substitui atomicamente o destino final.
 
 ## Cache
 
 O cache local fica em `translation_cache.json` e não é versionado pelo Git. O schema
-atual é `2`. A chave inclui:
+atual é `3`. A chave inclui:
 
 - formato da legenda;
 - texto limpo;
@@ -175,9 +198,9 @@ python -m pytest tests -q
 ```
 
 A suíte não precisa de um Ollama real. Ela usa um cliente simulado e cobre pipeline
-completo, cache, retries por item, BOM UTF-8, CRLF/LF, tags SRT, posicionamento já
-existente, blocos vazios, quebras, hifens de diálogo, artefatos proibidos, Flask,
-Flet/PySide6 e regressões ASS.
+completo, cache, warning externo, retries por item, recuperação individual, falha segura,
+manifesto de outputs, BOM UTF-8, CRLF/LF, tags SRT, posicionamento já existente, blocos
+vazios, quebras, hifens de diálogo, scanner ASS, Flask, Flet/PySide6 e regressões ASS/SRT.
 
 O workflow `Tests` executa a suíte no Windows em pushes e pull requests. O workflow
 manual `Release GUI` também exige os testes antes de empacotar e publicar artefatos.
@@ -210,8 +233,9 @@ modelo escolhido continuam necessários no computador ou endpoint remoto.
   à API do Ollama. Use uma URL completa, como `http://host:11434`.
 - **Nenhum arquivo encontrado:** confirme se a legenda está diretamente na pasta de
   entrada e termina em `.ass` ou `.srt`.
-- **Item manteve o inglês:** consulte o log. Uma resposta inválida usa fallback seguro
-  por design, sem remover o bloco ou alterar seus horários.
+- **Falha definitiva em itens:** consulte o log. Por padrão nenhum novo arquivo é
+  publicado. Corrija a causa e execute novamente; use `--allow-original-fallback`
+  somente se aceitar conscientemente uma possível mistura de idiomas.
 - **Tag SRT rejeitada:** corrija tags simples sem fechamento ou aninhamento inválido no
   arquivo original. Marcações desconhecidas são preservadas, mas não são convertidas.
 - **Build falhou:** instale `requirements.txt`, confirme Python compatível e execute o

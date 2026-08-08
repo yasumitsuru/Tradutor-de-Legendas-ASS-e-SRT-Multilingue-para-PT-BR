@@ -13,6 +13,7 @@ from translation_engine import (
     CONFIG,
     ITEM_BLOCK_RE,
     FixedASSTranslator,
+    IncompleteTranslationError,
 )
 
 
@@ -105,6 +106,26 @@ def test_cache_uses_versioned_schema(tmp_path: Path) -> None:
     assert payload["entries"] == {"key": "value"}
 
 
+def test_previous_cache_schema_is_ignored(tmp_path: Path) -> None:
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "prompt_version": "subtitle-items-v1",
+                "entries": {"old-key": "Old cached translation"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, cache_file=str(cache_path), enable_cache=True)
+    )
+
+    assert translator.cache == {}
+
+
 def test_legacy_ass_escape_helpers_remain_compatible(tmp_path: Path) -> None:
     translator = FixedASSTranslator(translator_config(tmp_path))
     source = r"First line\NSecond line\hnow"
@@ -145,6 +166,117 @@ def test_batch_retries_only_the_missing_item(tmp_path: Path) -> None:
     assert len(client.prompts) == 2
     assert "<<<ITEM_0001>>>" not in client.prompts[1]
     assert "<<<ITEM_0002>>>" in client.prompts[1]
+
+
+def test_external_response_residue_does_not_invalidate_valid_item(tmp_path: Path) -> None:
+    class ResidueOllama:
+        def generate(self, **_kwargs) -> dict[str, str]:
+            return {
+                "response": (
+                    "Here is the translation:\n\n"
+                    "<<<ITEM_0001>>>\nOlá\n<<<END_ITEM_0001>>>"
+                )
+            }
+
+    translator = FixedASSTranslator(translator_config(tmp_path), ResidueOllama())
+    handler = SRTFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch([handler.prepare_text("Hello")], handler, 1, 1)
+    )[0]
+
+    assert outcome.text == "Olá"
+    assert not outcome.used_fallback
+
+
+def test_valid_items_survive_residue_and_only_missing_item_is_retried(
+    tmp_path: Path,
+) -> None:
+    class PartialResidueOllama:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return {
+                    "response": (
+                        "Here is the translation:\n\n"
+                        "<<<ITEM_0001>>>\nPrimeiro\n<<<END_ITEM_0001>>>"
+                    )
+                }
+            return {
+                "response": "<<<ITEM_0002>>>\nSegundo\n<<<END_ITEM_0002>>>"
+            }
+
+    client = PartialResidueOllama()
+    translator = FixedASSTranslator(translator_config(tmp_path), client)
+    handler = SRTFormatHandler()
+    prepared = [handler.prepare_text("First"), handler.prepare_text("Second")]
+
+    outcomes = asyncio.run(translator.translate_single_batch(prepared, handler, 1, 1))
+
+    assert [outcome.text for outcome in outcomes] == ["Primeiro", "Segundo"]
+    assert len(client.prompts) == 2
+    assert "<<<ITEM_0001>>>" not in client.prompts[1]
+    assert "<<<ITEM_0002>>>" in client.prompts[1]
+
+
+def test_unexpected_item_is_discarded_and_logged_without_invalidating_expected_item(
+    tmp_path: Path, capsys
+) -> None:
+    class ExtraItemOllama:
+        def generate(self, **_kwargs) -> dict[str, str]:
+            return {
+                "response": (
+                    "<<<ITEM_0001>>>\nEsperado\n<<<END_ITEM_0001>>>\n"
+                    "<<<ITEM_9999>>>\nNão deve entrar\n<<<END_ITEM_9999>>>"
+                )
+            }
+
+    handler = SRTFormatHandler()
+    translator = FixedASSTranslator(translator_config(tmp_path), ExtraItemOllama())
+
+    outcome = asyncio.run(
+        translator.translate_single_batch([handler.prepare_text("Expected")], handler, 1, 1)
+    )[0]
+    output = capsys.readouterr().out
+
+    assert outcome.text == "Esperado"
+    assert not outcome.used_fallback
+    assert "ITEM inesperado 9999 descartado" in output
+
+
+def test_individual_recovery_uses_zero_temperature_without_mutating_config(
+    tmp_path: Path,
+) -> None:
+    class RecoveringOllama:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float]] = []
+
+        def generate(self, *, prompt: str, options: dict, **_kwargs) -> dict[str, str]:
+            self.calls.append((prompt, options["temperature"]))
+            if len(self.calls) <= 2:
+                return {"response": "invalid response"}
+            item_id = ITEM_BLOCK_RE.search(prompt).group(1)
+            return {
+                "response": f"<<<ITEM_{item_id}>>>\nRecuperado\n<<<END_ITEM_{item_id}>>>"
+            }
+
+    client = RecoveringOllama()
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, temperature=0.35, retry_count=2), client
+    )
+    handler = SRTFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch([handler.prepare_text("Recover me")], handler, 1, 1)
+    )[0]
+
+    assert outcome.text == "Recuperado"
+    assert not outcome.used_fallback
+    assert [temperature for _prompt, temperature in client.calls] == [0.35, 0.35, 0.0]
+    assert translator.config["temperature"] == 0.35
 
 
 def test_permanently_missing_item_falls_back_without_losing_valid_item(tmp_path: Path) -> None:
@@ -251,3 +383,72 @@ def test_full_mocked_ollama_ass_pipeline_preserves_regressions(tmp_path: Path) -
     assert translated.events[0].effect == "fade"
     assert translated.events[1].type == "Comment"
     assert translated.events[2].text == r"Espere\hpor mim."
+
+
+class AlwaysInvalidOllama:
+    def generate(self, **_kwargs) -> dict[str, str]:
+        return {"response": "invalid response"}
+
+
+def test_definitive_failure_keeps_existing_output_unchanged_by_default(
+    tmp_path: Path,
+) -> None:
+    source = FIXTURES / "sample.ass"
+    destination = tmp_path / "sample.pt.ass"
+    old_bytes = b"existing output from an earlier run"
+    destination.write_bytes(old_bytes)
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), AlwaysInvalidOllama()
+    )
+
+    with pytest.raises(IncompleteTranslationError, match="Arquivo não será salvo"):
+        asyncio.run(translator.translate_file(source, destination))
+
+    assert destination.read_bytes() == old_bytes
+
+
+def test_explicit_original_fallback_preserves_legacy_save_behavior(tmp_path: Path) -> None:
+    source = FIXTURES / "sample.ass"
+    destination = tmp_path / "sample.pt.ass"
+    translator = FixedASSTranslator(
+        translator_config(
+            tmp_path,
+            retry_count=1,
+            allow_original_fallback=True,
+        ),
+        AlwaysInvalidOllama(),
+    )
+
+    stats = asyncio.run(translator.translate_file(source, destination))
+
+    assert stats["failed"] > 0
+    assert destination.exists()
+    assert ASSFormatHandler().load(destination).events[0].text == (
+        r"{\an8}{\i1}I am here{\i0}\N- Are you ready?"
+    )
+
+
+def test_serialized_candidate_failure_does_not_replace_existing_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = FIXTURES / "sample.ass"
+    destination = tmp_path / "sample.pt.ass"
+    old_bytes = b"existing output from an earlier run"
+    destination.write_bytes(old_bytes)
+    translator = FixedASSTranslator(translator_config(tmp_path), TranslatingOllama())
+    original_validate = translator._validate_rebuilt_document
+    validation_calls = 0
+
+    def fail_second_validation(original, rebuilt, handler) -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 2:
+            raise RuntimeError("serialized candidate rejected")
+        original_validate(original, rebuilt, handler)
+
+    monkeypatch.setattr(translator, "_validate_rebuilt_document", fail_second_validation)
+
+    with pytest.raises(RuntimeError, match="candidate rejected"):
+        asyncio.run(translator.translate_file(source, destination))
+
+    assert destination.read_bytes() == old_bytes
