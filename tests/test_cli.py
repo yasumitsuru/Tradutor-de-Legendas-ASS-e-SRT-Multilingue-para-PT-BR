@@ -147,6 +147,66 @@ def test_cli_original_fallback_defaults_false_and_is_propagated_when_enabled(
     assert received_configs[0]["allow_original_fallback"] is True
 
 
+def test_cli_source_language_defaults_to_auto_and_propagates_any_manual_value(
+    tmp_path: Path, monkeypatch
+) -> None:
+    parser = translate_ass_fast.build_argument_parser()
+    assert parser.parse_args([]).source_language == "auto"
+    assert parser.parse_args(["--source-language", "Klingon"]).source_language == "Klingon"
+    assert "detecção automática por item" in " ".join(parser.format_help().split())
+
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.srt").write_text("fixture", encoding="utf-8")
+    received_configs: list[dict] = []
+
+    class FakeTranslator:
+        def __init__(self, config) -> None:
+            received_configs.append(config)
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            [
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--source-language",
+                "Klingon",
+                "--no-cache",
+            ]
+        )
+    )
+
+    assert result == 0
+    assert received_configs[0]["source_language"] == "Klingon"
+
+
+def test_readme_and_cli_help_present_the_project_as_multilingual() -> None:
+    readme = (Path(translate_ass_fast.__file__).parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+    help_text = translate_ass_fast.build_argument_parser().format_help()
+
+    assert readme.splitlines()[0] == "# Tradutor de Legendas ASS e SRT Multilíngue para PT-BR"
+    assert "detecção automática por item" in readme
+    assert "--source-language" in help_text
+    assert "Inglês para Português" not in readme.splitlines()[0]
+
+
 def test_cli_failed_run_keeps_old_output_and_leaves_manifest_empty(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

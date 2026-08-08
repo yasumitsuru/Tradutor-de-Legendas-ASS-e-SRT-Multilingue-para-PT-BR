@@ -72,3 +72,23 @@ def test_desktop_sources_expose_both_file_picker_extensions() -> None:
     assert "Permitir manter texto original quando a tradução falhar" in pyside_source
     assert "pode gerar legendas misturando PT-BR com o idioma original" in flet_source
     assert "pode gerar legendas misturando PT-BR com o idioma original" in pyside_source
+    assert "Multilíngue" in flet_source
+    assert "Multilíngue" in pyside_source
+    assert "Inglês → Português" not in flet_source
+    assert "Ingles para Portugues" not in pyside_source
+    assert "--source-language" not in app_flet._build_command(
+        {
+            "model": "qwen2.5:14b",
+            "batch_size": "10",
+            "timeout": "60",
+        }
+    )
+    assert "--source-language" not in app_gui._build_command(
+        {
+            "input_dir": "entrada",
+            "output_dir": "saida",
+            "model": "qwen2.5:14b",
+            "batch_size": "10",
+            "timeout": "60",
+        }
+    )

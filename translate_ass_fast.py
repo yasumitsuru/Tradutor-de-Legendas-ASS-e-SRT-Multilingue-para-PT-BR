@@ -104,7 +104,9 @@ def shutdown_ollama_model(model_name: str) -> None:
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the public CLI parser for local and packaged entrypoints."""
 
-    parser = argparse.ArgumentParser(description="Tradutor de legendas ASS/SRT em lote")
+    parser = argparse.ArgumentParser(
+        description="Tradutor multilíngue de legendas ASS/SRT para PT-BR"
+    )
     parser.add_argument(
         "-i", "--input-dir", default="./entrada", help="Pasta com legendas de entrada"
     )
@@ -112,6 +114,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "-o", "--output-dir", default="./saida", help="Pasta de saída das legendas traduzidas"
     )
     parser.add_argument("-m", "--model", default=CONFIG["model"], help="Modelo Ollama")
+    parser.add_argument(
+        "--source-language",
+        default=CONFIG["source_language"],
+        metavar="IDIOMA",
+        help='Idioma de origem. Use "auto" para detecção automática por item',
+    )
     parser.add_argument(
         "--batch-size", type=int, default=CONFIG["batch_size"], help="Itens por lote"
     )
@@ -189,6 +197,10 @@ async def main(argv: Sequence[str] | None = None) -> int:
     if args.timeout < 1:
         print("❌ Timeout deve ser maior que zero.")
         return 1
+    source_language = args.source_language.strip()
+    if not source_language:
+        print('❌ Idioma de origem não pode ser vazio. Use "auto" para detecção automática.')
+        return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.result_manifest is not None:
@@ -221,6 +233,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
     config: dict[str, Any] = {
         **CONFIG,
         "model": args.model,
+        "source_language": source_language,
         "batch_size": args.batch_size,
         "timeout": args.timeout,
         "turbo_mode": args.turbo,
@@ -231,6 +244,11 @@ async def main(argv: Sequence[str] | None = None) -> int:
         config["temperature"] = 0.15
         config["batch_size"] = min(config["batch_size"], 10)
         print("🔥 MODO TURBO ATIVADO")
+
+    if config["source_language"].casefold() == "auto":
+        print("🌐 Idioma de origem: detecção automática por item")
+    else:
+        print(f"🌐 Idioma de origem informado: {config['source_language']}")
 
     try:
         ensure_ollama_model_available(config["model"])

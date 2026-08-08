@@ -21,7 +21,7 @@ from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import is_supported_subtitle, iter_subtitle_files
 
 
-APP_TITLE = "Tradutor de legendas ASS/SRT - Inglês para Português"
+APP_TITLE = "Tradutor de Legendas ASS e SRT Multilíngue para PT-BR"
 ACCENT = "#0F766E"
 ACCENT_DARK = "#115E59"
 BLUE = "#2563EB"
@@ -552,13 +552,13 @@ class TranslatorFletApp:
                     ft.Column(
                         [
                             ft.Text(
-                                "Tradutor de Legendas ASS",
+                                "Tradutor de Legendas ASS e SRT",
                                 size=23,
                                 weight=ft.FontWeight.W_700,
                                 color=TEXT,
                             ),
                             ft.Text(
-                                "Inglês → Português do Brasil • processamento local com Ollama",
+                                "Multilíngue → PT-BR • detecção automática por item com Ollama",
                                 size=13,
                                 color=MUTED,
                             ),
@@ -1342,7 +1342,8 @@ class TranslatorFletApp:
     def _on_about_clicked(self, _: Any) -> None:
         self._show_message(
             "Sobre",
-            "Tradutor de legendas ASS/SRT do Inglês para Português do Brasil\n"
+            "Tradutor de Legendas ASS e SRT Multilíngue para PT-BR\n"
+            "Detecção automática de um ou mais idiomas por item\n"
             "Interface Flet para Windows • desenvolvido por Yasu\n\n"
             "O executável inclui Python, Flet e as bibliotecas do projeto. "
             "O Ollama e o modelo escolhido devem estar disponíveis localmente ou pela rede.",

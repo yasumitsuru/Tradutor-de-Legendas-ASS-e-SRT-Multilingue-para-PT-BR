@@ -159,6 +159,23 @@ def test_web_fallback_option_is_visible_unchecked_and_propagated(web_client) -> 
     assert "--result-manifest" in disabled
 
 
+def test_web_copy_presents_automatic_multilingual_translation(web_client) -> None:
+    html = web_client.get("/").get_data(as_text=True)
+
+    assert "Multilíngue" in html
+    assert "PT-BR" in html
+    assert "do Inglês para Português" not in html
+    assert "--source-language" not in web_app._build_command(
+        {
+            "input_dir": "entrada",
+            "output_dir": "saida",
+            "model": "qwen2.5:14b",
+            "batch_size": "10",
+            "timeout": "60",
+        }
+    )
+
+
 def test_web_does_not_present_or_download_old_output_without_current_manifest(
     web_client, tmp_path: Path
 ) -> None:

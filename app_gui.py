@@ -490,7 +490,7 @@ class TranslationWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Tradutor de legendas ASS/SRT - Ingles para Portugues (by Yasu)")
+        self.setWindowTitle("Tradutor de Legendas ASS e SRT Multilíngue para PT-BR (by Yasu)")
         self.resize(1180, 760)
 
         self._worker: Optional[TranslationWorker] = None
@@ -529,7 +529,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(12)
 
-        title = QLabel("Tradutor de legendas ASS/SRT do Ingles para o Portugues Brasil")
+        title = QLabel("Tradutor de Legendas ASS e SRT Multilíngue para PT-BR")
         title.setObjectName("title")
         root.addWidget(title)
 
@@ -1131,7 +1131,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "Sobre",
-            "Tradutor de legendas ASS/SRT do Ingles para o Portugues Brasil\n"
+            "Tradutor de Legendas ASS e SRT Multilíngue para PT-BR\n"
+            "Detecção automática de um ou mais idiomas por item\n"
             "Desenvolvido por Yasu\n\n"
             "Interface grafica (PySide6) para o backend translate_ass_fast.py,\n"
             "usando modelos locais via Ollama.",

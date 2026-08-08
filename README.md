@@ -1,14 +1,29 @@
-# Tradutor de legendas ASS/SRT — Inglês para Português Brasil
+# Tradutor de Legendas ASS e SRT Multilíngue para PT-BR
 
-Aplicação local para traduzir legendas `.ass` e `.srt` com modelos executados pelo
-[Ollama](https://ollama.com/). O projeto oferece a mesma base de tradução por quatro
-formas de uso: linha de comando, interface web Flask, aplicativo Flet e aplicativo
-PySide6.
+Aplicação local para traduzir legendas `.ass` e `.srt` de um ou mais idiomas para
+português do Brasil com modelos executados pelo [Ollama](https://ollama.com/). A
+detecção automática por item acontece semanticamente em cada legenda: uma mesma fala
+pode combinar vários idiomas e partes que já estão em português. O projeto oferece a
+mesma base de tradução por quatro formas de uso: linha de comando, interface web Flask,
+aplicativo Flet e aplicativo PySide6.
 
 O pipeline preserva horários, ordem dos eventos, estrutura de linhas e marcações já
 existentes. Respostas incompletas ou estruturalmente inseguras repetem somente os itens
 afetados e recebem uma última tentativa individual. Por padrão, uma falha definitiva
 impede o salvamento do arquivo para evitar legendas misturando idiomas.
+
+## Detecção multilíngue
+
+O modo padrão é `auto`. O texto natural visível de cada item completo é enviado ao
+modelo, que detecta o idioma ou os idiomas presentes e produz uma única fala natural em
+PT-BR. O pipeline não separa palavras ou fragmentos para traduzi-los isoladamente e não
+usa uma biblioteca externa de detecção. Isso mantém o contexto de exemplos mistos como
+`Ich brauche the key para abrir a porta`.
+
+Conteúdo já natural em português deve ser preservado, enquanto nomes próprios,
+honoríficos, siglas e termos técnicos permanecem protegidos pelas instruções do modelo.
+A detecção é baseada na capacidade multilíngue do modelo configurado e pode cometer
+erros; o projeto não promete detecção perfeita. O modelo padrão é `qwen2.5:14b`.
 
 ## Formatos suportados
 
@@ -86,6 +101,9 @@ python translate_ass_fast.py `
 Opções úteis:
 
 - `--format all|ass|srt`: filtra o formato de entrada;
+- `--source-language IDIOMA`: define a origem. O padrão `auto` detecta um ou mais
+  idiomas por item; também são aceitas strings livres como `English` ou `German` para
+  uso manual;
 - `--clear-cache`: remove o cache antes do processamento;
 - `--no-cache`: não lê nem grava traduções em cache;
 - `--allow-original-fallback`: permite explicitamente manter o texto original nos itens
@@ -132,6 +150,8 @@ python app_gui.py
 
 As duas interfaces desktop selecionam múltiplas legendas ASS/SRT, exibem entrada e
 saída, oferecem cancelamento e empacotam os resultados em ZIP. Flask, Flet e PySide
+usam detecção automática multilíngue por item e mantêm PT-BR como destino. A decisão
+semântica permanece exclusivamente no backend compartilhado. As interfaces também
 oferecem a opção desativada por padrão **Permitir manter texto original quando a
 tradução falhar**, acompanhada do aviso sobre mistura de idiomas. As interfaces apenas
 repassam essa escolha ao mesmo backend e usam as mesmas validações.
@@ -177,13 +197,13 @@ do formato. Somente depois dessa validação ele substitui atomicamente o destin
 ## Cache
 
 O cache local fica em `translation_cache.json` e não é versionado pelo Git. O schema
-atual é `3`. A chave inclui:
+atual é `4`. A chave inclui:
 
 - formato da legenda;
 - texto limpo;
 - estrutura de quebras;
 - marcações protegidas;
-- idiomas de origem e destino;
+- modo/idioma de origem (`auto` ou valor manual) e idioma de destino;
 - modelo Ollama;
 - versão do prompt.
 
@@ -198,9 +218,10 @@ python -m pytest tests -q
 ```
 
 A suíte não precisa de um Ollama real. Ela usa um cliente simulado e cobre pipeline
-completo, cache, warning externo, retries por item, recuperação individual, falha segura,
-manifesto de outputs, BOM UTF-8, CRLF/LF, tags SRT, posicionamento já existente, blocos
-vazios, quebras, hifens de diálogo, scanner ASS, Flask, Flet/PySide6 e regressões ASS/SRT.
+completo, prompts multilíngues, conteúdo de idiomas mistos, cache, warning externo,
+retries por item, recuperação individual, falha segura, manifesto de outputs, BOM UTF-8,
+CRLF/LF, tags SRT, posicionamento já existente, blocos vazios, quebras, hifens de
+diálogo, scanner ASS, Flask, Flet/PySide6 e regressões ASS/SRT.
 
 O workflow `Tests` executa a suíte no Windows em pushes e pull requests. O workflow
 manual `Release GUI` também exige os testes antes de empacotar e publicar artefatos.

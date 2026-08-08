@@ -63,6 +63,161 @@ def translator_config(tmp_path: Path, **overrides) -> dict:
     }
 
 
+def test_default_language_configuration_and_system_prompt_are_multilingual() -> None:
+    prompt = CONFIG["system_prompt"].casefold()
+
+    assert CONFIG["source_language"] == "auto"
+    assert "idioma ou idiomas" in prompt
+    assert "português" in prompt
+    assert "nome" in prompt
+    assert "honorífico" in prompt
+    assert "do inglês" not in prompt
+
+
+def test_auto_prompts_detect_multiple_languages_per_item_and_keep_protocol(
+    tmp_path: Path,
+) -> None:
+    handler = SRTFormatHandler()
+    translator = FixedASSTranslator(translator_config(tmp_path))
+    prepared = handler.prepare_text("Ich brauche the key para abrir a porta.")
+
+    batch_prompt = translator._build_item_prompt([(1, prepared)])
+    individual_prompt = translator._build_individual_prompt(1, prepared)
+
+    for prompt in (batch_prompt, individual_prompt):
+        normalized = prompt.casefold()
+        assert "detecte" in normalized
+        assert "idioma ou idiomas" in normalized
+        assert "mesma fala" in normalized or "mesmo item" in normalized
+        assert "já estiver em português" in normalized
+        assert "palavras isoladas significativas" in normalized
+        assert "yes" in normalized
+        assert "ja" in normalized
+        assert "sim" in normalized
+        assert "primeira pessoa" in normalized
+        for first_person_form in ("I", "I'm", "I've", "I'll", "I'd"):
+            assert first_person_form in prompt
+        assert "nome" in normalized
+        assert "honorífico" in normalized
+        assert "exclusivamente inglês" not in normalized
+        assert prompt.count("<<<ITEM_0001>>>") == 1
+        assert prompt.count("<<<END_ITEM_0001>>>") == 1
+        assert prepared.model_text in prompt
+
+
+def test_manual_source_language_remains_available_without_a_rigid_language_list(
+    tmp_path: Path,
+) -> None:
+    handler = SRTFormatHandler()
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, source_language="Klingon"),
+    )
+
+    prompt = translator._build_item_prompt([(1, handler.prepare_text("nuqneH"))])
+
+    assert "Klingon" in prompt
+    assert "detecção automática" not in prompt.casefold()
+
+
+def test_multilingual_items_are_translated_as_complete_semantic_units(
+    tmp_path: Path,
+) -> None:
+    translations = {
+        "Ich brauche the key para abrir a porta.": "Preciso da chave para abrir a porta.",
+        "I don't know, aber ele já foi embora.": "Eu não sei, mas ele já foi embora.",
+        "Eu já encontrei the key.": "Eu já encontrei a chave.",
+        "Eu não sei o que aconteceu.": "Eu não sei o que aconteceu.",
+        "Oogami-kun!": "Oogami-kun!",
+    }
+
+    class MultilingualOllama:
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            blocks = []
+            for match in ITEM_BLOCK_RE.finditer(prompt):
+                item_id, body = match.group(1), match.group(2).strip()
+                blocks.append(
+                    f"<<<ITEM_{item_id}>>>\n{translations[body]}\n"
+                    f"<<<END_ITEM_{item_id}>>>"
+                )
+            return {"response": "\n".join(blocks)}
+
+    handler = SRTFormatHandler()
+    prepared = [handler.prepare_text(source) for source in translations]
+    translator = FixedASSTranslator(
+        translator_config(tmp_path),
+        MultilingualOllama(),
+    )
+
+    outcomes = asyncio.run(translator.translate_single_batch(prepared, handler, 1, 1))
+
+    assert [outcome.text for outcome in outcomes] == list(translations.values())
+    assert all(not outcome.used_fallback for outcome in outcomes)
+
+
+def test_auto_prompt_preserves_each_ass_marker_exactly_once(tmp_path: Path) -> None:
+    handler = ASSFormatHandler()
+    prepared = handler.prepare_text(r"{\i1}Ich brauche the key{\i0}\NJá volto.")
+    translator = FixedASSTranslator(translator_config(tmp_path))
+
+    prompt = translator._build_item_prompt([(1, prepared)])
+
+    assert prepared.markers
+    assert all(prompt.count(marker.token) == 1 for marker in prepared.markers)
+
+
+def test_english_first_person_forms_reach_the_model_unchanged_and_translate(
+    tmp_path: Path,
+) -> None:
+    translations = {
+        "I": "Eu",
+        "I'm ready.": "Estou pronto.",
+        "I've arrived.": "Cheguei.",
+        "I'll wait.": "Vou esperar.",
+        "I'd rather stay.": "Eu preferiria ficar.",
+    }
+    seen: list[str] = []
+
+    class FirstPersonOllama:
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            blocks = []
+            for match in ITEM_BLOCK_RE.finditer(prompt):
+                item_id, body = match.group(1), match.group(2).strip()
+                seen.append(body)
+                translated = translations.get(body, body)
+                blocks.append(
+                    f"<<<ITEM_{item_id}>>>\n{translated}\n<<<END_ITEM_{item_id}>>>"
+                )
+            return {"response": "\n".join(blocks)}
+
+    handler = SRTFormatHandler()
+    prepared = [handler.prepare_text(source) for source in translations]
+    translator = FixedASSTranslator(translator_config(tmp_path), FirstPersonOllama())
+
+    outcomes = asyncio.run(translator.translate_single_batch(prepared, handler, 1, 1))
+
+    assert seen == list(translations)
+    assert [outcome.text for outcome in outcomes] == list(translations.values())
+
+
+@pytest.mark.parametrize("text", ["I", "A", "É", "Yes", "Ja", "Sim"])
+def test_meaningful_isolated_words_are_not_skipped(tmp_path: Path, text: str) -> None:
+    translator = FixedASSTranslator(translator_config(tmp_path))
+
+    assert translator.should_skip_line(text) == (False, "")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", " ", ".", "...", "♪", "-", "_", "(door closes)", "[music]", "uh", "wow"],
+)
+def test_multilingual_short_text_support_preserves_existing_skip_rules(
+    tmp_path: Path, text: str
+) -> None:
+    translator = FixedASSTranslator(translator_config(tmp_path))
+
+    assert translator.should_skip_line(text)[0] is True
+
+
 @pytest.mark.parametrize(
     ("format_name", "source_text"),
     [
@@ -111,8 +266,8 @@ def test_previous_cache_schema_is_ignored(tmp_path: Path) -> None:
     cache_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
-                "prompt_version": "subtitle-items-v1",
+                "schema_version": CACHE_SCHEMA_VERSION - 1,
+                "prompt_version": "subtitle-items-v2",
                 "entries": {"old-key": "Old cached translation"},
             }
         ),
@@ -124,6 +279,14 @@ def test_previous_cache_schema_is_ignored(tmp_path: Path) -> None:
     )
 
     assert translator.cache == {}
+
+
+def test_cache_key_distinguishes_auto_from_explicit_source_language(tmp_path: Path) -> None:
+    prepared = SRTFormatHandler().prepare_text("Hello")
+    automatic = FixedASSTranslator(translator_config(tmp_path, source_language="auto"))
+    manual = FixedASSTranslator(translator_config(tmp_path, source_language="English"))
+
+    assert automatic._get_text_hash(prepared) != manual._get_text_hash(prepared)
 
 
 def test_legacy_ass_escape_helpers_remain_compatible(tmp_path: Path) -> None:

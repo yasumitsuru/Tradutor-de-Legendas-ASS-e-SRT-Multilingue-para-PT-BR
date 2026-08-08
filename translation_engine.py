@@ -26,8 +26,8 @@ from subtitle_formats import (
 )
 
 
-CACHE_SCHEMA_VERSION = 3
-PROMPT_VERSION = "subtitle-items-v2"
+CACHE_SCHEMA_VERSION = 4
+PROMPT_VERSION = "subtitle-items-v3-multilingual-auto"
 ITEM_BLOCK_RE = re.compile(
     r"<<<ITEM_(\d{4})>>>[ \t]*\r?\n?(.*?)[ \t]*\r?\n?<<<END_ITEM_\1>>>",
     re.IGNORECASE | re.DOTALL,
@@ -53,16 +53,20 @@ CONFIG: dict[str, Any] = {
     "min_text_length": 2,
     "skip_sfx": True,
     "turbo_mode": False,
-    "source_language": "English",
+    "source_language": "auto",
     "target_language": "Brazilian Portuguese",
     "allow_original_fallback": False,
     "prompt_version": PROMPT_VERSION,
     "system_prompt": (
-        "Traduza do inglês para português do Brasil. Produza texto natural, fluente e conciso "
-        "para legendas. Preserve significado, nomes próprios, termos técnicos, honoríficos, tom, "
-        "formalidade e informalidade. Não censure, não invente, não remova conteúdo e não explique. "
-        "Sempre traduza o pronome I isolado como Eu e mantenha o sentido das contrações de primeira "
-        "pessoa. Responda somente no protocolo solicitado, sem Markdown."
+        "Traduza texto natural de legendas para português do Brasil. Quando a origem estiver em "
+        "modo automático, detecte o idioma ou idiomas presentes em cada item; quando um idioma de "
+        "origem for informado explicitamente, respeite essa instrução. Uma mesma fala pode misturar "
+        "vários idiomas. Traduza todo conteúdo natural que ainda não esteja em português, preserve "
+        "o significado das partes que já estiverem em português e integre tudo em uma única fala "
+        "natural, fluente e concisa. "
+        "Preserve nomes próprios, honoríficos, siglas, termos técnicos, marcadores protegidos, tom, "
+        "formalidade e informalidade. Não identifique os idiomas, não censure, não invente, não "
+        "remova conteúdo e não explique. Responda somente no protocolo solicitado, sem Markdown."
     ),
 }
 
@@ -118,6 +122,10 @@ class FixedASSTranslator:
 
     def __init__(self, config: Mapping[str, Any], ollama_client: Any | None = None):
         self.config = {**CONFIG, **dict(config)}
+        source_language = str(self.config.get("source_language", "auto")).strip()
+        self.config["source_language"] = (
+            "auto" if not source_language or source_language.casefold() == "auto" else source_language
+        )
         self.ollama_client = ollama_client or ollama
         self.stats: dict[str, int] = {}
         self.reset_stats()
@@ -275,49 +283,13 @@ class FixedASSTranslator:
         repaired = re.sub(r"\[{1,3}\s*ASS_[A-Za-z_]+\s*\]{1,3}", "", repaired)
         return re.sub(r"[ \t]{2,}", " ", repaired).strip()
 
-    @staticmethod
-    def normalize_apostrophes(text: str) -> str:
-        return text.replace("’", "'").replace("`", "'").replace("´", "'")
-
-    def normalize_first_person_source(self, text: str) -> str:
-        normalized = self.normalize_apostrophes(text)
-        replacements = {
-            r"\b[Ii]'m\b": "I am",
-            r"\b[Ii]'ve\b": "I have",
-            r"\b[Ii]'ll\b": "I will",
-            r"\b[Ii]'d\b": "I would",
-        }
-        for pattern, replacement in replacements.items():
-            normalized = re.sub(pattern, replacement, normalized)
-        return normalized
-
-    def fix_first_person_translation(self, source_text: str, translated_text: str) -> str:
-        """Repair a small set of English first-person fragments without touching tokens."""
-
-        source_token = re.sub(r"[^\w']", "", self.normalize_apostrophes(source_text)).lower()
-        translated = self.normalize_apostrophes(translated_text)
-        if source_token == "i":
-            return re.sub(r"\b[Ii]\b", "Eu", translated, count=1)
-        replacements = (
-            (r"\b[Ii]['’]m\b", "Eu estou"),
-            (r"\b[Ii]['’]ve\b", "Eu tenho"),
-            (r"\b[Ii]['’]ll\b", "Eu vou"),
-            (r"\b[Ii] am\b", "Eu estou"),
-            (r"\b[Ii] have\b", "Eu tenho"),
-            (r"\b[Ii] will\b", "Eu vou"),
-        )
-        for pattern, replacement in replacements:
-            translated = re.sub(pattern, replacement, translated, count=1, flags=re.IGNORECASE)
-        return translated
-
     def should_skip_line(self, text: str) -> tuple[bool, str]:
         """Determine whether visible text is meaningful enough to translate."""
 
         clean = self.clean_ass_tags(text)
-        normalized_word = re.sub(r"[^\w']", "", clean).lower()
-        if normalized_word == "i":
-            return False, ""
         if len(clean) < self.config["min_text_length"]:
+            if any(character.isalpha() for character in clean):
+                return False, ""
             return True, "too_short"
         for pattern in self.skip_patterns:
             if pattern.match(clean):
@@ -421,17 +393,44 @@ class FixedASSTranslator:
             raise ValueError("parse_ass_file aceita somente arquivos ASS.")
         return subs, lines
 
+    def _source_language_instruction(self) -> str:
+        """Describe automatic or explicit source semantics without detecting in Python."""
+
+        source_language = str(self.config["source_language"])
+        first_person_instruction = (
+            "Quando encontrar as formas inglesas I, I'm, I've, I'll e I'd, traduza "
+            "explicitamente seu sentido de primeira pessoa para PT-BR; não as mantenha em inglês."
+        )
+        if source_language.casefold() == "auto":
+            source_instruction = (
+                "Detecte automaticamente o idioma ou idiomas presentes no texto natural de cada "
+                "ITEM. Um mesmo ITEM e uma mesma fala podem misturar vários idiomas. Traduza todo "
+                "conteúdo natural que não estiver em português para português do Brasil. Se uma "
+                "parte já estiver em português, preserve seu significado e integre a fala completa "
+                "em uma única versão natural em PT-BR. Preserve nomes próprios, honoríficos, "
+                "siglas e termos técnicos. Palavras isoladas significativas também são conteúdo "
+                "natural: traduza-as quando estiverem em outro idioma, como Yes ou Ja, e preserve-as "
+                "quando já estiverem em português, como Sim."
+            )
+        else:
+            source_instruction = (
+                f"Considere {source_language} como o idioma de origem informado para cada ITEM e "
+                f"traduza o texto natural completo para {self.config['target_language']}. Preserve "
+                "nomes próprios, honoríficos, siglas e termos técnicos."
+            )
+        return f"{source_instruction} {first_person_instruction}"
+
     def _build_item_prompt(
         self, pending: Sequence[tuple[int, PreparedSubtitleText]]
     ) -> str:
         item_blocks = "\n".join(
-            f"<<<ITEM_{item_id:04d}>>>\n{self.normalize_first_person_source(prepared.model_text)}\n"
+            f"<<<ITEM_{item_id:04d}>>>\n{prepared.model_text}\n"
             f"<<<END_ITEM_{item_id:04d}>>>"
             for item_id, prepared in pending
         )
         return (
-            f"Traduza cada item de {self.config['source_language']} para "
-            f"{self.config['target_language']}.\n"
+            f"{self._source_language_instruction()}\n"
+            f"Destino obrigatório: {self.config['target_language']}.\n"
             "Regras obrigatórias:\n"
             "- devolva exatamente os mesmos delimitadores ITEM, sem criar ou renumerar itens;\n"
             "- devolva somente as traduções dentro dos itens, sem explicações, Markdown ou listas;\n"
@@ -447,13 +446,13 @@ class FixedASSTranslator:
         """Build the strict minimal prompt used for final per-item recovery."""
 
         return (
-            f"Traduza de {self.config['source_language']} para "
-            f"{self.config['target_language']}.\n"
+            f"{self._source_language_instruction()}\n"
+            f"Destino obrigatório: {self.config['target_language']}.\n"
             "Responda somente com o mesmo bloco ITEM, sem Markdown ou explicações. "
             "Preserve literalmente os tokens entre colchetes triplos e não crie "
             "tags, comandos ou quebras.\n\n"
             f"<<<ITEM_{item_id:04d}>>>\n"
-            f"{self.normalize_first_person_source(prepared.model_text)}\n"
+            f"{prepared.model_text}\n"
             f"<<<END_ITEM_{item_id:04d}>>>"
         )
 
@@ -528,7 +527,6 @@ class FixedASSTranslator:
         ):
             raise SubtitleValidationError("A resposta introduziu numeração de lista.")
         normalized_body = re.sub(r"[ \t]{2,}", " ", body.strip())
-        normalized_body = self.fix_first_person_translation(prepared.cleaned_text, normalized_body)
         return handler.restore_text(prepared, normalized_body)
 
     async def translate_single_batch(
