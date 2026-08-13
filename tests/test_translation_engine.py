@@ -331,6 +331,108 @@ def test_batch_retries_only_the_missing_item(tmp_path: Path) -> None:
     assert "<<<ITEM_0002>>>" in client.prompts[1]
 
 
+def test_explicit_batch_envelope_contract_prevents_real_missing_start_response(
+    tmp_path: Path,
+) -> None:
+    real_malformed_response = (
+        "ITEM_0001\n"
+        "Antes que você entre no estado de perda e então "
+        "[[[ASS_TAG_0001]]]me[[[ASS_TAG_0002]]] atrapalhe.\n"
+        "<<<END_ITEM_0001>>>"
+    )
+
+    class ProtocolSensitiveOllama:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            self.prompts.append(prompt)
+            if "exatamente um par completo por ID" not in prompt:
+                return {"response": real_malformed_response}
+            return {
+                "response": (
+                    "<<<ITEM_0001>>>\n"
+                    "Antes que você entre no estado de perda e então "
+                    "[[[ASS_TAG_0001]]]me[[[ASS_TAG_0002]]] atrapalhe.\n"
+                    "<<<END_ITEM_0001>>>"
+                )
+            }
+
+    source = r"Bevor du in den Lost-Zustand gerätst und {\i1}mir{\i0} im Weg stehst."
+    client = ProtocolSensitiveOllama()
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), client
+    )
+    handler = ASSFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text(source)], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.text == (
+        r"Antes que você entre no estado de perda e então {\i1}me{\i0} atrapalhe."
+    )
+    assert not outcome.used_fallback
+    assert len(client.prompts) == 1
+
+
+def test_batch_parser_rejects_nested_item_instead_of_contaminating_outer_body() -> None:
+    response = (
+        "<<<ITEM_0001>>>\n"
+        "ASTRONOMIA_ALPHA\n"
+        "<<<ITEM_0002>>>\n"
+        "CULINARIA_BETA\n"
+        "<<<END_ITEM_0002>>>\n"
+        "<<<END_ITEM_0001>>>"
+    )
+
+    parsed, warning = FixedASSTranslator._parse_item_response(response)
+
+    assert parsed == {}
+    assert warning is not None
+    assert "aninhado" in warning.casefold()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        (
+            "<<<ITEM_0001>>>\nPrimeiro\n<<<END_ITEM_0001>>>\n"
+            "<<<ITEM_0001>>>\nDuplicado\n<<<END_ITEM_0001>>>"
+        ),
+        "<<<ITEM_0001>>>\nBloco parcial",
+        "Primeiro corpo sem ID\nSegundo corpo sem ID",
+        "Here is the translation: Primeiro corpo sem ID",
+        "```text\nPrimeiro corpo sem ID\n```",
+    ],
+)
+def test_batch_parser_does_not_map_ambiguous_or_unidentified_bodies(
+    response: str,
+) -> None:
+    parsed, _warning = FixedASSTranslator._parse_item_response(response)
+
+    assert 1 not in parsed
+
+
+def test_synthetic_domains_remain_bound_to_ids_even_when_blocks_are_reordered() -> None:
+    response = (
+        "<<<ITEM_0003>>>\nFUTEBOL_GAMMA: gol no estádio\n<<<END_ITEM_0003>>>\n"
+        "<<<ITEM_0001>>>\nASTRONOMIA_ALPHA: estrela distante\n<<<END_ITEM_0001>>>\n"
+        "<<<ITEM_0002>>>\nCULINARIA_BETA: panela no fogo\n<<<END_ITEM_0002>>>"
+    )
+
+    parsed, warning = FixedASSTranslator._parse_item_response(response)
+
+    assert warning is None
+    assert parsed == {
+        1: "ASTRONOMIA_ALPHA: estrela distante",
+        2: "CULINARIA_BETA: panela no fogo",
+        3: "FUTEBOL_GAMMA: gol no estádio",
+    }
+
+
 def test_external_response_residue_does_not_invalidate_valid_item(tmp_path: Path) -> None:
     class ResidueOllama:
         def generate(self, **_kwargs) -> dict[str, str]:
@@ -350,6 +452,41 @@ def test_external_response_residue_does_not_invalidate_valid_item(tmp_path: Path
 
     assert outcome.text == "Olá"
     assert not outcome.used_fallback
+
+
+def test_reordered_items_are_mapped_by_id_without_cross_contamination(
+    tmp_path: Path,
+) -> None:
+    class ReorderedOllama:
+        def generate(self, **_kwargs) -> dict[str, str]:
+            return {
+                "response": (
+                    "<<<ITEM_0002>>>\nSegundo: BETAQUASAR\n<<<END_ITEM_0002>>>\n"
+                    "<<<ITEM_0001>>>\nPrimeiro: ALPHAORCHID\n<<<END_ITEM_0001>>>"
+                )
+            }
+
+    handler = SRTFormatHandler()
+    translator = FixedASSTranslator(
+        translator_config(tmp_path), ReorderedOllama()
+    )
+
+    outcomes = asyncio.run(
+        translator.translate_single_batch(
+            [
+                handler.prepare_text("First: ALPHAORCHID"),
+                handler.prepare_text("Second: BETAQUASAR"),
+            ],
+            handler,
+            1,
+            1,
+        )
+    )
+
+    assert [item.text for item in outcomes] == [
+        "Primeiro: ALPHAORCHID",
+        "Segundo: BETAQUASAR",
+    ]
 
 
 def test_valid_items_survive_residue_and_only_missing_item_is_retried(
@@ -419,7 +556,7 @@ def test_individual_recovery_uses_zero_temperature_without_mutating_config(
 
         def generate(self, *, prompt: str, options: dict, **_kwargs) -> dict[str, str]:
             self.calls.append((prompt, options["temperature"]))
-            if len(self.calls) <= 2:
+            if options["temperature"] != 0.0:
                 return {"response": "invalid response"}
             item_id = ITEM_BLOCK_RE.search(prompt).group(1)
             return {
@@ -438,8 +575,512 @@ def test_individual_recovery_uses_zero_temperature_without_mutating_config(
 
     assert outcome.text == "Recuperado"
     assert not outcome.used_fallback
-    assert [temperature for _prompt, temperature in client.calls] == [0.35, 0.35, 0.0]
+    assert [temperature for _prompt, temperature in client.calls] == [0.35, 0.0]
     assert translator.config["temperature"] == 0.35
+
+
+def test_individual_recovery_accepts_guarded_bare_body_observed_from_real_ollama(
+    tmp_path: Path,
+) -> None:
+    class RealBareRecoveryOllama:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, **_kwargs) -> dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"response": "invalid batch response"}
+            return {
+                "response": (
+                    "Sakurakouji-san, infelizmente ninguém consegue me entender"
+                    "[[[ASS_LINE_BREAK_0001]]]."
+                )
+            }
+
+    client = RealBareRecoveryOllama()
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), client
+    )
+    handler = ASSFormatHandler()
+    prepared = handler.prepare_text(
+        r"Sakurakouji-san, unglücklicherweise kann mich \Nweder irgendjemand verstehen,"
+    )
+
+    outcome = asyncio.run(
+        translator.translate_single_batch([prepared], handler, 1, 1)
+    )[0]
+
+    assert outcome.text == (
+        "Sakurakouji-san, infelizmente ninguém consegue me entender\\N."
+    )
+    assert not outcome.used_fallback
+    assert client.calls == 2
+
+
+def test_individual_bare_recovery_still_rejects_missing_protected_marker(
+    tmp_path: Path,
+) -> None:
+    class MissingMarkerRecoveryOllama:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, **_kwargs) -> dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"response": "invalid batch response"}
+            return {
+                "response": (
+                    "Sakura, isso é a primeira vez que você está tão ocupada com um menino, "
+                    "ou não?"
+                )
+            }
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), MissingMarkerRecoveryOllama()
+    )
+    handler = ASSFormatHandler()
+    prepared = handler.prepare_text(
+        r"Sakura, das ist ja das erste Mal, \Ndass dich ein Junge so beschäftigt, oder?"
+    )
+
+    outcome = asyncio.run(
+        translator.translate_single_batch([prepared], handler, 1, 1)
+    )[0]
+
+    assert outcome.used_fallback
+    assert "marcador protegido" in str(outcome.error)
+
+
+def test_missing_ass_line_break_recovers_by_translating_unambiguous_segments(
+    tmp_path: Path,
+) -> None:
+    source = (
+        r"Sakura, das ist ja das erste Mal, \N"
+        r"dass dich ein Junge so beschäftigt, oder?"
+    )
+    observed_missing_marker_response = (
+        "Sakura, esta é a primeira vez que um garoto mexe tanto com você, não é?"
+    )
+    segment_translations = {
+        "Sakura, das ist ja das erste Mal,": "Sakura, esta é a primeira vez,",
+        "dass dich ein Junge so beschäftigt, oder?": (
+            "que um garoto mexe tanto com você, não é?"
+        ),
+    }
+
+    class ObservedLineBreakFailureOllama:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            self.prompts.append(prompt)
+            matches = list(ITEM_BLOCK_RE.finditer(prompt))
+            if "[[[ASS_LINE_BREAK_0001]]]" in prompt:
+                item_id = matches[0].group(1)
+                return {
+                    "response": (
+                        f"<<<ITEM_{item_id}>>>\n{observed_missing_marker_response}\n"
+                        f"<<<END_ITEM_{item_id}>>>"
+                    )
+                }
+            return {
+                "response": "\n".join(
+                    f"<<<ITEM_{match.group(1)}>>>\n"
+                    f"{segment_translations[match.group(2).strip()]}\n"
+                    f"<<<END_ITEM_{match.group(1)}>>>"
+                    for match in matches
+                )
+            }
+
+    client = ObservedLineBreakFailureOllama()
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), client
+    )
+    handler = ASSFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text(source)], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.text == (
+        r"Sakura, esta é a primeira vez,\N"
+        r"que um garoto mexe tanto com você, não é?"
+    )
+    assert not outcome.used_fallback
+    assert "[[[ASS_LINE_BREAK_0001]]]" in client.prompts[0]
+    assert "[[[ASS_LINE_BREAK_0001]]]" not in client.prompts[-1]
+    recovery_prompts = [
+        prompt
+        for prompt in client.prompts
+        if "[[[ASS_LINE_BREAK_0001]]]" not in prompt
+    ]
+    assert len(recovery_prompts) == 2
+    assert all(len(list(ITEM_BLOCK_RE.finditer(prompt))) == 1 for prompt in recovery_prompts)
+
+
+def test_ass_line_break_segment_recovery_preserves_multiple_breaks_tags_and_prefixes(
+    tmp_path: Path,
+) -> None:
+    source = r"{\i1}Start\Nend{\i0}\N- Wait"
+
+    class StructuredSegmentsOllama:
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            matches = list(ITEM_BLOCK_RE.finditer(prompt))
+            if "ASS_LINE_BREAK" in prompt:
+                item_id = matches[0].group(1)
+                return {
+                    "response": (
+                        f"<<<ITEM_{item_id}>>>\n"
+                        "[[[ASS_TAG_0001]]]Comece, termine e "
+                        "espere[[[ASS_TAG_0003]]][[[ASS_PREFIX_0005]]]\n"
+                        f"<<<END_ITEM_{item_id}>>>"
+                    )
+                }
+            blocks = []
+            for match in matches:
+                item_id = match.group(1)
+                translated = (
+                    match.group(2).strip()
+                    .replace("Start", "Comece")
+                    .replace("end", "fim")
+                    .replace("Wait", "Espere")
+                )
+                blocks.append(
+                    f"<<<ITEM_{item_id}>>>\n{translated}\n<<<END_ITEM_{item_id}>>>"
+                )
+            return {"response": "\n".join(blocks)}
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), StructuredSegmentsOllama()
+    )
+    handler = ASSFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text(source)], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.text == r"{\i1}Comece\Nfim{\i0}\N- Espere"
+    assert not outcome.used_fallback
+
+
+def test_ass_line_break_segment_recovery_is_atomic_when_one_segment_fails(
+    tmp_path: Path,
+) -> None:
+    source = r"First\NSecond"
+
+    class OneFailedSegmentOllama:
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            matches = list(ITEM_BLOCK_RE.finditer(prompt))
+            if "ASS_LINE_BREAK" in prompt:
+                item_id = matches[0].group(1)
+                return {
+                    "response": (
+                        f"<<<ITEM_{item_id}>>>\nPrimeiro e segundo\n"
+                        f"<<<END_ITEM_{item_id}>>>"
+                    )
+                }
+            blocks = []
+            for match in matches:
+                body = match.group(2).strip()
+                if body == "Second":
+                    continue
+                item_id = match.group(1)
+                blocks.append(
+                    f"<<<ITEM_{item_id}>>>\nPrimeiro\n<<<END_ITEM_{item_id}>>>"
+                )
+            return {
+                "response": "\n".join(blocks) or "Here is the translation: invalid"
+            }
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), OneFailedSegmentOllama()
+    )
+    handler = ASSFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text(source)], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.text == source
+    assert outcome.used_fallback
+    assert "segmento" in str(outcome.error).casefold()
+
+
+def test_repositioned_ass_line_break_recovers_at_the_original_segment_boundary(
+    tmp_path: Path,
+) -> None:
+    source = r"First\NSecond"
+
+    class RepositionedLineBreakOllama:
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            matches = list(ITEM_BLOCK_RE.finditer(prompt))
+            if "ASS_LINE_BREAK" in prompt:
+                item_id = matches[0].group(1)
+                return {
+                    "response": (
+                        f"<<<ITEM_{item_id}>>>\n"
+                        "[[[ASS_LINE_BREAK_0001]]]Primeiro segundo\n"
+                        f"<<<END_ITEM_{item_id}>>>"
+                    )
+                }
+            translations = {"First": "Primeiro", "Second": "Segundo"}
+            return {
+                "response": "\n".join(
+                    f"<<<ITEM_{match.group(1)}>>>\n"
+                    f"{translations[match.group(2).strip()]}\n"
+                    f"<<<END_ITEM_{match.group(1)}>>>"
+                    for match in matches
+                )
+            }
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), RepositionedLineBreakOllama()
+    )
+    handler = ASSFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text(source)], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.text == r"Primeiro\NSegundo"
+    assert not outcome.used_fallback
+
+
+def test_individual_recovery_rejects_multiple_item_blocks(tmp_path: Path) -> None:
+    class MultipleItemsRecoveryOllama:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, **_kwargs) -> dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"response": "invalid batch response"}
+            return {
+                "response": (
+                    "<<<ITEM_0001>>>\nRecuperado\n<<<END_ITEM_0001>>>\n"
+                    "<<<ITEM_9999>>>\nOutra fala\n<<<END_ITEM_9999>>>"
+                )
+            }
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), MultipleItemsRecoveryOllama()
+    )
+    handler = SRTFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text("Recover me")], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.used_fallback
+    assert "múltiplos" in str(outcome.error).casefold()
+
+
+@pytest.mark.parametrize(
+    "unsafe_response",
+    [
+        "Here is the translation: Recuperado",
+        "Resultado: Recuperado",
+        "# Recuperado",
+        "**Recuperado**",
+        "*Recuperado*",
+        "__Recuperado__",
+        "_Recuperado_",
+        "~~Recuperado~~",
+        "`Recuperado`",
+        "[Recuperado](https://example.com)",
+        "```text\nRecuperado\n```",
+        "Recuperado\nOutra fala",
+        "Recuperado\n<<<END_ITEM_0001>>>",
+    ],
+)
+def test_individual_bare_recovery_rejects_unsafe_unwrapped_content(
+    tmp_path: Path, unsafe_response: str
+) -> None:
+    class UnsafeBareRecoveryOllama:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, **_kwargs) -> dict[str, str]:
+            self.calls += 1
+            return {
+                "response": "invalid batch response" if self.calls == 1 else unsafe_response
+            }
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1), UnsafeBareRecoveryOllama()
+    )
+    handler = SRTFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text("Recover me")], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.used_fallback
+
+
+def test_optional_trace_observes_selective_retry_and_individual_recovery(
+    tmp_path: Path,
+) -> None:
+    class TraceableRecoveryOllama:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, *, prompt: str, **_kwargs) -> dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "response": "<<<ITEM_0001>>>\nPrimeiro\n<<<END_ITEM_0001>>>"
+                }
+            if self.calls == 2:
+                return {
+                    "response": (
+                        "<<<ITEM_0002>>>\n[[[SRT_TAG_9999]]]\n"
+                        "<<<END_ITEM_0002>>>"
+                    )
+                }
+            return {
+                "response": "<<<ITEM_0002>>>\nSegundo\n<<<END_ITEM_0002>>>"
+            }
+
+    trace: list[dict] = []
+    translator = FixedASSTranslator(
+        translator_config(
+            tmp_path,
+            retry_count=2,
+            trace_hook=trace.append,
+        ),
+        TraceableRecoveryOllama(),
+    )
+    handler = SRTFormatHandler()
+
+    outcomes = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text("First"), handler.prepare_text("Second")],
+            handler,
+            3,
+            9,
+        )
+    )
+
+    assert [outcome.text for outcome in outcomes] == ["Primeiro", "Segundo"]
+    attempts = [item for item in trace if item["event"] == "batch_attempt_started"]
+    assert [item["item_ids"] for item in attempts] == [[1, 2], [2]]
+    assert [item["attempt"] for item in attempts] == [1, 2]
+    assert all(item["batch_num"] == 3 and item["total_batches"] == 9 for item in attempts)
+    assert all("<<<ITEM_" in item["prompt"] for item in attempts)
+    rejected = [item for item in trace if item["event"] == "item_rejected"]
+    assert [(item["item_id"], item["mode"]) for item in rejected] == [
+        (2, "batch"),
+        (2, "batch"),
+    ]
+    assert any("ausente" in item["reason"].casefold() for item in rejected)
+    assert any("desconhecido" in item["reason"].casefold() for item in rejected)
+    individual = [item for item in trace if item["event"] == "individual_attempt_started"]
+    assert len(individual) == 1
+    assert individual[0]["item_ids"] == [2]
+    assert individual[0]["temperature"] == 0.0
+    accepted = [item for item in trace if item["event"] == "item_accepted"]
+    assert [(item["item_id"], item["mode"]) for item in accepted] == [
+        (1, "batch"),
+        (2, "individual"),
+    ]
+    individual_recovered = [
+        item for item in trace if item["event"] == "individual_recovery_completed"
+    ]
+    assert [
+        (item["item_id"], item["mode"], item["batch_num"], item["total_batches"])
+        for item in individual_recovered
+    ] == [(2, "individual", 3, 9)]
+    responses = [item for item in trace if item["event"] == "model_response"]
+    assert len(responses) == 3
+    assert all(item["response"] for item in responses)
+
+
+def test_definitive_failure_trace_retains_source_event_descriptor(tmp_path: Path) -> None:
+    class AlwaysMissingOllama:
+        def generate(self, **_kwargs) -> dict[str, str]:
+            return {"response": ""}
+
+    trace: list[dict] = []
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, retry_count=1, trace_hook=trace.append),
+        AlwaysMissingOllama(),
+    )
+    handler = SRTFormatHandler()
+    prepared = handler.prepare_text("Never returned")
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [prepared],
+            handler,
+            1,
+            1,
+            trace_items=[{"event_index": 42, "text_hash": "a" * 64}],
+        )
+    )[0]
+
+    assert outcome.used_fallback
+    failed = next(item for item in trace if item["event"] == "item_failed")
+    assert failed["items"] == [
+        {"item_id": 1, "event_index": 42, "text_hash": "a" * 64}
+    ]
+
+
+def test_trace_hook_failure_never_changes_translation_behavior(tmp_path: Path) -> None:
+    client = TranslatingOllama()
+
+    def broken_trace(_event: dict) -> None:
+        raise RuntimeError("trace sink unavailable")
+
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, trace_hook=broken_trace),
+        client,
+    )
+    handler = SRTFormatHandler()
+
+    outcome = asyncio.run(
+        translator.translate_single_batch(
+            [handler.prepare_text("Hello, world.")], handler, 1, 1
+        )
+    )[0]
+
+    assert outcome.text == "Olá, mundo."
+    assert len(client.prompts) == 1
+
+
+def test_file_trace_links_batch_items_to_source_event_indices(tmp_path: Path) -> None:
+    trace: list[dict] = []
+    source = FIXTURES / "sample.ass"
+    output = tmp_path / "sample.pt.ass"
+    translator = FixedASSTranslator(
+        translator_config(tmp_path, trace_hook=trace.append),
+        TranslatingOllama(),
+    )
+
+    stats = asyncio.run(translator.translate_file(source, output))
+
+    file_started = [item for item in trace if item["event"] == "file_started"]
+    file_completed = [item for item in trace if item["event"] == "file_completed"]
+    attempts = [item for item in trace if item["event"] == "batch_attempt_started"]
+    assert len(file_started) == len(file_completed) == 1
+    assert Path(file_started[0]["file"]).name == "sample.ass"
+    assert Path(file_completed[0]["output"]).name == "sample.pt.ass"
+    assert file_completed[0]["stats"] == stats
+    traced_items = [item for attempt in attempts for item in attempt["items"]]
+    assert {item["event_index"] for item in traced_items} == {0, 2}
+    assert all(len(item["text_hash"]) == 64 for item in traced_items)
 
 
 def test_permanently_missing_item_falls_back_without_losing_valid_item(tmp_path: Path) -> None:

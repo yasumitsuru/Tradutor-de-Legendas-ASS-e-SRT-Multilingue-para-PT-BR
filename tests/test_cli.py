@@ -195,6 +195,89 @@ def test_cli_source_language_defaults_to_auto_and_propagates_any_manual_value(
     assert received_configs[0]["source_language"] == "Klingon"
 
 
+def test_cli_passes_optional_trace_hook_without_exposing_a_public_flag(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    trace: list[dict] = []
+    trace_hook = trace.append
+    received_configs: list[dict] = []
+
+    class FakeTranslator:
+        def __init__(self, config) -> None:
+            received_configs.append(config)
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            [
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--no-cache",
+            ],
+            trace_hook=trace_hook,
+        )
+    )
+
+    assert result == 0
+    assert received_configs[0]["trace_hook"] is trace_hook
+    assert "trace_hook" not in vars(translate_ass_fast.build_argument_parser().parse_args([]))
+
+
+def test_cli_uses_an_internal_isolated_cache_path_when_provided(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    cache_path = tmp_path / "experiment" / "translation_cache.json"
+    cache_path.parent.mkdir()
+    received_configs: list[dict] = []
+
+    class FakeTranslator:
+        def __init__(self, config) -> None:
+            received_configs.append(config)
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            ["--input-dir", str(input_dir), "--output-dir", str(output_dir)],
+            cache_file=cache_path,
+        )
+    )
+
+    assert result == 0
+    assert received_configs[0]["cache_file"] == str(cache_path)
+
+
 def test_readme_and_cli_help_present_the_project_as_multilingual() -> None:
     readme = (Path(translate_ass_fast.__file__).parent / "README.md").read_text(
         encoding="utf-8"

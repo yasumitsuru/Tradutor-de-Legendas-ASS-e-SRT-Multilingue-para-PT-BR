@@ -223,6 +223,50 @@ retries por item, recuperação individual, falha segura, manifesto de outputs, 
 CRLF/LF, tags SRT, posicionamento já existente, blocos vazios, quebras, hifens de
 diálogo, scanner ASS, Flask, Flet/PySide6 e regressões ASS/SRT.
 
+### Regressão ASS com Ollama real
+
+A bateria real é manual e permanece fora do CI. Ela descobre `.ass`/`.ASS`, chama a
+mesma CLI de produção, desativa cache por padrão, valida estrutura/tags/quebras e grava
+relatórios reproduzíveis em `test_results/<run-id>/<experimento>/`. Essa pasta nunca é
+versionada e um experimento existente não é sobrescrito.
+
+Baseline completa:
+
+```powershell
+$env:OLLAMA_HOST = "http://127.0.0.1:11434"
+python tools/run_ass_regression.py --experiment baseline --no-cache
+```
+
+Para selecionar qualquer outro modelo disponível sem alterar a configuração de
+produção, acrescente `--model NOME_DO_MODELO` e use um nome de experimento distinto.
+
+Um único arquivo:
+
+```powershell
+python tools/run_ass_regression.py `
+  --file ".\entrada\episodio.ass" `
+  --experiment single_episode `
+  --no-cache
+```
+
+Comparação de batch no mesmo agrupamento de execução:
+
+```powershell
+python tools/run_ass_regression.py --run-id investigacao_01 --experiment batch_1 --batch-size 1
+python tools/run_ass_regression.py --run-id investigacao_01 --experiment batch_5 --batch-size 5
+python tools/run_ass_regression.py --run-id investigacao_01 --experiment turbo --batch-size 15 --turbo
+```
+
+Relatório detalhado e promoção de warnings semânticos de alta confiança:
+
+```powershell
+python tools/run_ass_regression.py --experiment revisao --verbose --strict-semantic
+```
+
+O exit code é diferente de zero para corrupção objetiva, output ausente/incompleto ou
+falha da rota de produção. Warnings de qualidade sem tradução humana de referência não
+falham por padrão. Ollama/modelo indisponível retorna estado `NOT_EXECUTED`, nunca PASS.
+
 O workflow `Tests` executa a suíte no Windows em pushes e pull requests. O workflow
 manual `Release GUI` também exige os testes antes de empacotar e publicar artefatos.
 

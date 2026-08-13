@@ -24,8 +24,10 @@ _runtime/
 
 # App data (local)
 translation_cache.json
+.translation_run_outputs.json
 web_config.json
 *.log
+test_results/
 entrada/*
 !entrada/.gitkeep
 saida/*

@@ -587,6 +587,28 @@ class SubtitleFormatHandler(ABC):
         if marker_positions != sorted(marker_positions):
             raise SubtitleValidationError("A tradução alterou a ordem das marcações protegidas.")
 
+        line_break_markers = [
+            marker for marker in prepared.markers if marker.kind == "line_break"
+        ]
+        if line_break_markers:
+            def content_signature(value: str) -> tuple[bool, ...]:
+                segments: list[str] = []
+                cursor = 0
+                for marker in line_break_markers:
+                    position = value.index(marker.token, cursor)
+                    segments.append(value[cursor:position])
+                    cursor = position + len(marker.token)
+                segments.append(value[cursor:])
+                return tuple(
+                    bool(_INTERNAL_PLACEHOLDER_RE.sub("", segment).strip())
+                    for segment in segments
+                )
+
+            if content_signature(normalized) != content_signature(prepared.model_text):
+                raise SubtitleValidationError(
+                    "A tradução deslocou uma quebra protegida para um limite estrutural inválido."
+                )
+
         # Raw ASS commands in a model response are always invented: legitimate source
         # commands were replaced with protected tokens above.
         if _ASS_COMMAND_RE.search(normalized):
@@ -602,6 +624,67 @@ class SubtitleFormatHandler(ABC):
         if self._line_structure(restored) != prepared.line_structure:
             raise SubtitleValidationError("A tradução alterou a estrutura de linhas.")
         return restored.strip()
+
+    def split_at_line_breaks(
+        self, prepared: PreparedSubtitleText
+    ) -> tuple[tuple[PreparedSubtitleText, ...], tuple[str, ...]]:
+        """Split one prepared item at exact source line breaks for safe recovery."""
+
+        if prepared.format_name != self.format_name:
+            raise SubtitleValidationError("O texto preparado pertence a outro formato.")
+
+        segments: list[PreparedSubtitleText] = []
+        separators: list[str] = []
+        cursor = 0
+        for match in self.marker_pattern.finditer(prepared.original_text):
+            value = match.group(0)
+            if self._marker_kind(value) != "line_break":
+                continue
+            segments.append(self.prepare_text(prepared.original_text[cursor : match.start()]))
+            separators.append(value)
+            cursor = match.end()
+        segments.append(self.prepare_text(prepared.original_text[cursor:]))
+
+        if tuple(separators) != prepared.line_structure:
+            raise SubtitleValidationError(
+                "Não foi possível segmentar exatamente as quebras protegidas."
+            )
+        return tuple(segments), tuple(separators)
+
+    def join_line_break_segments(
+        self,
+        prepared: PreparedSubtitleText,
+        translated_segments: Sequence[str],
+        separators: Sequence[str],
+    ) -> str:
+        """Rejoin independently validated segments at unambiguous source boundaries."""
+
+        if len(translated_segments) != len(separators) + 1:
+            raise SubtitleValidationError(
+                "A recuperação segmentada alterou a quantidade de segmentos."
+            )
+        if tuple(separators) != prepared.line_structure:
+            raise SubtitleValidationError(
+                "A recuperação segmentada alterou as quebras originais."
+            )
+
+        parts: list[str] = []
+        for index, segment in enumerate(translated_segments):
+            assert_no_internal_artifacts(segment)
+            parts.append(segment)
+            if index < len(separators):
+                parts.append(separators[index])
+        restored = "".join(parts)
+        rebuilt = self.prepare_text(restored)
+        if rebuilt.line_structure != prepared.line_structure:
+            raise SubtitleValidationError(
+                "A recuperação segmentada alterou a estrutura de linhas."
+            )
+        if rebuilt.protected_markings != prepared.protected_markings:
+            raise SubtitleValidationError(
+                "A recuperação segmentada alterou as marcações protegidas."
+            )
+        return restored
 
     def rebuild(
         self,

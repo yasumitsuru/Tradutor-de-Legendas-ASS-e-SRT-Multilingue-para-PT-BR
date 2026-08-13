@@ -27,7 +27,7 @@ from subtitle_formats import (
 
 
 CACHE_SCHEMA_VERSION = 4
-PROMPT_VERSION = "subtitle-items-v3-multilingual-auto"
+PROMPT_VERSION = "subtitle-items-v4-multilingual-auto-item-envelope"
 ITEM_BLOCK_RE = re.compile(
     r"<<<ITEM_(\d{4})>>>[ \t]*\r?\n?(.*?)[ \t]*\r?\n?<<<END_ITEM_\1>>>",
     re.IGNORECASE | re.DOTALL,
@@ -37,6 +37,23 @@ MODEL_MESSAGE_RE = re.compile(
     r"(?:here\s+is\s+the\s+translation|translation\s*:|tradu[cç][aã]o\s*:)", re.IGNORECASE
 )
 NUMBERED_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s+")
+INDIVIDUAL_ITEM_ARTIFACT_RE = re.compile(
+    r"(?:<{2,3}|>{2,3})|(?:END[_\s-]*)?ITEM[_\s-]*\d+", re.IGNORECASE
+)
+BATCH_NESTED_ITEM_ARTIFACT_RE = re.compile(
+    r"(?:<{2,3}\s*(?:END[_\s-]*)?ITEM[_\s-]*[A-Z0-9_-]+\s*>{0,3})|"
+    r"(?:(?:END_)?ITEM_[A-Z0-9_-]+\s*>{2,3})",
+    re.IGNORECASE,
+)
+INDIVIDUAL_RAW_MARKDOWN_RE = re.compile(
+    r"^\s*(?:#{1,6}\s|>\s|[-*+]\s)|"
+    r"(?:\*\*[^*\r\n]+\*\*|__[^_\r\n]+__|~~[^~\r\n]+~~|"
+    r"(?<!\*)\*[^*\r\n]+\*(?!\*)|(?<!_)_[^_\r\n]+_(?!_)|"
+    r"`[^`\r\n]+`|\[[^\]\r\n]+\]\([^\)\r\n]+\))"
+)
+INDIVIDUAL_RAW_EXPLANATION_RE = re.compile(
+    r"^\s*(?:resultado|result|resposta|answer|aqui está|here is)\s*:", re.IGNORECASE
+)
 
 
 CONFIG: dict[str, Any] = {
@@ -115,6 +132,7 @@ class TranslationOutcome:
     text: str
     used_fallback: bool = False
     error: str | None = None
+    line_break_recovery_eligible: bool = False
 
 
 class FixedASSTranslator:
@@ -122,6 +140,9 @@ class FixedASSTranslator:
 
     def __init__(self, config: Mapping[str, Any], ollama_client: Any | None = None):
         self.config = {**CONFIG, **dict(config)}
+        trace_hook = self.config.pop("trace_hook", None)
+        self._trace_hook = trace_hook if callable(trace_hook) else None
+        self._trace_file: str | None = None
         source_language = str(self.config.get("source_language", "auto")).strip()
         self.config["source_language"] = (
             "auto" if not source_language or source_language.casefold() == "auto" else source_language
@@ -144,6 +165,24 @@ class FixedASSTranslator:
         """Reset per-file counters."""
 
         self.stats = {"total": 0, "translated": 0, "failed": 0, "cached": 0, "skipped": 0}
+
+    def _emit_trace(self, event: str, **details: Any) -> None:
+        """Notify an optional diagnostic observer without affecting translation."""
+
+        if self._trace_hook is None:
+            return
+        payload: dict[str, Any] = {
+            "event": event,
+            "recorded_at": datetime.now().astimezone().isoformat(),
+        }
+        if self._trace_file is not None:
+            payload["file"] = self._trace_file
+        payload.update(details)
+        try:
+            self._trace_hook(payload)
+        except Exception as exc:
+            print(f"⚠️ Instrumentação de diagnóstico desativada após falha: {exc}")
+            self._trace_hook = None
 
     def _load_cache(self) -> None:
         """Load only the current versioned cache schema."""
@@ -432,7 +471,12 @@ class FixedASSTranslator:
             f"{self._source_language_instruction()}\n"
             f"Destino obrigatório: {self.config['target_language']}.\n"
             "Regras obrigatórias:\n"
+            "- cada tradução deve ficar dentro de exatamente um par completo por ID: "
+            "abertura ITEM antes do texto e fechamento END_ITEM depois do texto, ambos "
+            "com literalmente os mesmos quatro dígitos recebidos;\n"
             "- devolva exatamente os mesmos delimitadores ITEM, sem criar ou renumerar itens;\n"
+            "- não omita, inverta, aninhe ou duplique delimitadores e nunca coloque a "
+            "tradução fora do par correspondente;\n"
             "- devolva somente as traduções dentro dos itens, sem explicações, Markdown ou listas;\n"
             "- preserve literalmente todos os tokens entre colchetes triplos, na mesma ordem;\n"
             "- não crie quebras, tags, comandos ASS, numeração ou conteúdo adicional;\n"
@@ -490,16 +534,27 @@ class FixedASSTranslator:
     def _parse_item_response(response_text: str) -> tuple[dict[int, str], str | None]:
         parsed: dict[int, str] = {}
         duplicated: set[int] = set()
+        nested: set[int] = set()
         for match in ITEM_BLOCK_RE.finditer(response_text):
             item_id = int(match.group(1))
+            body = match.group(2).strip()
+            if BATCH_NESTED_ITEM_ARTIFACT_RE.search(body):
+                nested.add(item_id)
+                continue
             if item_id in parsed:
                 duplicated.add(item_id)
             else:
-                parsed[item_id] = match.group(2).strip()
-        for item_id in duplicated:
+                parsed[item_id] = body
+        for item_id in duplicated | nested:
             parsed.pop(item_id, None)
 
         residue = ITEM_BLOCK_RE.sub("", response_text).strip()
+        if nested:
+            nested_ids = ", ".join(f"{item_id:04d}" for item_id in sorted(nested))
+            nested_warning = f"A resposta contém delimitador ITEM aninhado no(s) item(ns) {nested_ids}."
+            if residue:
+                nested_warning += " A resposta contém texto ou Markdown fora dos itens."
+            return parsed, nested_warning
         if residue:
             return parsed, "A resposta contém texto ou Markdown fora dos itens."
         return parsed, None
@@ -512,6 +567,62 @@ class FixedASSTranslator:
         for item_id in sorted(set(parsed) - expected):
             parsed.pop(item_id, None)
             print(f"   ⚠️ ITEM inesperado {item_id:04d} descartado.")
+
+    @staticmethod
+    def _parse_individual_response(
+        response_text: str, expected_item_id: int
+    ) -> tuple[str | None, list[int], str | None, str | None]:
+        """Extract one strict recovery body, optionally without an ITEM envelope."""
+
+        matches = list(ITEM_BLOCK_RE.finditer(response_text))
+        parsed, residue_warning = FixedASSTranslator._parse_item_response(response_text)
+        parsed_ids = sorted(parsed)
+        if (
+            len(matches) == 1
+            and int(matches[0].group(1)) == expected_item_id
+            and residue_warning is None
+        ):
+            return parsed.get(expected_item_id), parsed_ids, None, None
+        if matches:
+            if len(matches) > 1:
+                error = "A recuperação individual contém múltiplos ITEMs."
+            else:
+                error = "A recuperação individual contém ITEM conflitante ou resíduo externo."
+            return None, parsed_ids, residue_warning, error
+
+        candidate = response_text.strip()
+        if not candidate:
+            return None, parsed_ids, residue_warning, "A recuperação individual está vazia."
+        if INDIVIDUAL_ITEM_ARTIFACT_RE.search(candidate):
+            return (
+                None,
+                parsed_ids,
+                residue_warning,
+                "A recuperação individual contém delimitador ITEM parcial ou conflitante.",
+            )
+        if "\n" in candidate or "\r" in candidate:
+            return (
+                None,
+                parsed_ids,
+                residue_warning,
+                "A recuperação individual sem envelope contém múltiplas linhas físicas.",
+            )
+        visible_candidate = CONTROL_TOKEN_RE.sub("", candidate)
+        if INDIVIDUAL_RAW_MARKDOWN_RE.search(visible_candidate):
+            return None, parsed_ids, residue_warning, "A recuperação individual contém Markdown."
+        if INDIVIDUAL_RAW_EXPLANATION_RE.search(candidate):
+            return (
+                None,
+                parsed_ids,
+                residue_warning,
+                "A recuperação individual contém explicação externa.",
+            )
+        return (
+            candidate,
+            parsed_ids,
+            "Resposta individual sem envelope; aplicando validação estrutural estrita.",
+            None,
+        )
 
     def _validate_model_body(
         self,
@@ -535,14 +646,194 @@ class FixedASSTranslator:
         handler: SubtitleFormatHandler,
         batch_num: int,
         total_batches: int,
+        trace_items: Sequence[Mapping[str, Any]] | None = None,
     ) -> list[TranslationOutcome]:
-        """Translate a batch and retry only missing or structurally invalid items."""
+        """Translate a batch, recovering failed ASS breaks by validated segments."""
+
+        outcomes = await self._translate_single_batch_once(
+            prepared_items,
+            handler,
+            batch_num,
+            total_batches,
+            trace_items,
+        )
+        if handler.format_name != "ass":
+            return outcomes
+
+        recovered = list(outcomes)
+        for source_index, (prepared, outcome) in enumerate(
+            zip(prepared_items, outcomes), start=1
+        ):
+            if not self._needs_ass_line_break_recovery(prepared, outcome):
+                continue
+
+            segments, separators = handler.split_at_line_breaks(prepared)
+            translatable_indices = [
+                index for index, segment in enumerate(segments) if segment.model_text.strip()
+            ]
+            self._emit_trace(
+                "line_break_recovery_started",
+                mode="segmented",
+                batch_num=batch_num,
+                total_batches=total_batches,
+                item_id=source_index,
+                segment_count=len(segments),
+                separators=list(separators),
+                reason=outcome.error,
+            )
+
+            segment_results: list[TranslationOutcome | None] = [None] * len(segments)
+            if translatable_indices:
+                source_trace = (
+                    dict(trace_items[source_index - 1])
+                    if trace_items is not None and source_index - 1 < len(trace_items)
+                    else {}
+                )
+                for segment_index in translatable_indices:
+                    segment_outcome = await self._translate_single_batch_once(
+                        [segments[segment_index]],
+                        handler,
+                        batch_num,
+                        total_batches,
+                        [
+                            {
+                                **source_trace,
+                                "source_item_id": source_index,
+                                "segment_index": segment_index + 1,
+                                "segment_count": len(segments),
+                                "line_break_recovery": True,
+                            }
+                        ],
+                    )
+                    segment_results[segment_index] = segment_outcome[0]
+
+            for segment_index, segment in enumerate(segments):
+                if segment_results[segment_index] is None:
+                    segment_results[segment_index] = TranslationOutcome(segment.original_text)
+
+            failed_segments = [
+                (index, result)
+                for index, result in enumerate(segment_results, start=1)
+                if result is not None and result.used_fallback
+            ]
+            if failed_segments:
+                details = "; ".join(
+                    f"segmento {index}/{len(segments)}: {result.error}"
+                    for index, result in failed_segments
+                    if result is not None
+                )
+                recovered[source_index - 1] = TranslationOutcome(
+                    text=prepared.original_text,
+                    used_fallback=True,
+                    error=f"Recuperação segmentada falhou ({details}).",
+                )
+                self._emit_trace(
+                    "line_break_recovery_failed",
+                    mode="segmented",
+                    batch_num=batch_num,
+                    total_batches=total_batches,
+                    item_id=source_index,
+                    reason=recovered[source_index - 1].error,
+                )
+                continue
+
+            try:
+                restored = handler.join_line_break_segments(
+                    prepared,
+                    [result.text for result in segment_results if result is not None],
+                    separators,
+                )
+            except SubtitleValidationError as exc:
+                recovered[source_index - 1] = TranslationOutcome(
+                    text=prepared.original_text,
+                    used_fallback=True,
+                    error=f"Recuperação segmentada inválida: {exc}",
+                )
+                self._emit_trace(
+                    "line_break_recovery_failed",
+                    mode="segmented",
+                    batch_num=batch_num,
+                    total_batches=total_batches,
+                    item_id=source_index,
+                    reason=recovered[source_index - 1].error,
+                )
+                continue
+
+            recovered[source_index - 1] = TranslationOutcome(restored)
+            self._emit_trace(
+                "line_break_recovery_completed",
+                mode="segmented",
+                batch_num=batch_num,
+                total_batches=total_batches,
+                item_id=source_index,
+                segment_count=len(segments),
+            )
+        return recovered
+
+    @staticmethod
+    def _needs_ass_line_break_recovery(
+        prepared: PreparedSubtitleText, outcome: TranslationOutcome
+    ) -> bool:
+        """Limit segmented recovery to a line failure seen in an enveloped batch."""
+
+        return bool(
+            outcome.used_fallback
+            and outcome.line_break_recovery_eligible
+            and prepared.line_structure
+        )
+
+    @staticmethod
+    def _is_protected_line_break_error(
+        prepared: PreparedSubtitleText, error: str
+    ) -> bool:
+        """Identify validation errors caused specifically by protected line structure."""
+
+        normalized_error = error.casefold()
+        line_break_tokens = [
+            marker.token.casefold()
+            for marker in prepared.markers
+            if marker.kind == "line_break"
+        ]
+        return any(token in normalized_error for token in line_break_tokens) or any(
+            fragment in normalized_error
+            for fragment in (
+                "quantidade de linhas",
+                "múltiplas linhas físicas",
+                "multiplas linhas fisicas",
+                "quebra protegida",
+            )
+        )
+
+    async def _translate_single_batch_once(
+        self,
+        prepared_items: Sequence[PreparedSubtitleText],
+        handler: SubtitleFormatHandler,
+        batch_num: int,
+        total_batches: int,
+        trace_items: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[TranslationOutcome]:
+        """Run the existing ITEM protocol once, including selective recovery."""
 
         outcomes: list[TranslationOutcome | None] = [None] * len(prepared_items)
         pending: dict[int, PreparedSubtitleText] = {
             index: prepared for index, prepared in enumerate(prepared_items, start=1)
         }
         errors: dict[int, str] = {}
+        line_break_recovery_eligible: set[int] = set()
+        trace_lookup = {
+            item_id: {
+                "item_id": item_id,
+                **(
+                    dict(trace_items[item_id - 1])
+                    if trace_items is not None and item_id - 1 < len(trace_items)
+                    else {}
+                ),
+            }
+            for item_id in pending
+        }
+
+        def trace_descriptors(item_ids: Sequence[int]) -> list[dict[str, Any]]:
+            return [dict(trace_lookup[item_id]) for item_id in item_ids]
 
         for attempt in range(1, int(self.config["retry_count"]) + 1):
             if not pending:
@@ -552,13 +843,36 @@ class FixedASSTranslator:
                 f"   🔄 Batch {batch_num}/{total_batches} - tentativa {attempt} "
                 f"({len(pending_items)} item(ns))"
             )
+            prompt = self._build_item_prompt(pending_items)
+            trace_context = {
+                "mode": "batch",
+                "batch_num": batch_num,
+                "total_batches": total_batches,
+                "attempt": attempt,
+                "item_ids": [item_id for item_id, _prepared in pending_items],
+                "items": trace_descriptors(
+                    [item_id for item_id, _prepared in pending_items]
+                ),
+            }
+            self._emit_trace(
+                "batch_attempt_started",
+                **trace_context,
+                temperature=float(self.config["temperature"]),
+                prompt=prompt,
+            )
             try:
-                response_text = await self._generate(self._build_item_prompt(pending_items))
+                response_text = await self._generate(prompt)
             except asyncio.TimeoutError:
                 message = f"Timeout após {self.config['timeout']}s"
                 for item_id in pending:
                     errors[item_id] = message
                 print(f"   ⏰ {message} no batch {batch_num}.")
+                self._emit_trace(
+                    "model_error",
+                    **trace_context,
+                    error_type="TimeoutError",
+                    reason=message,
+                )
             except Exception as exc:
                 if is_model_not_found_error(exc):
                     raise ModelUnavailableError(
@@ -569,9 +883,29 @@ class FixedASSTranslator:
                 for item_id in pending:
                     errors[item_id] = message
                 print(f"   ❌ {message}")
+                self._emit_trace(
+                    "model_error",
+                    **trace_context,
+                    error_type=type(exc).__name__,
+                    reason=message,
+                )
             else:
+                self._emit_trace(
+                    "model_response",
+                    **trace_context,
+                    response=response_text,
+                )
                 parsed, response_warning = self._parse_item_response(response_text)
+                parsed_ids = sorted(parsed)
+                unexpected_ids = sorted(set(parsed) - set(pending))
                 self._discard_unexpected_items(parsed, tuple(pending))
+                self._emit_trace(
+                    "response_parsed",
+                    **trace_context,
+                    parsed_item_ids=parsed_ids,
+                    unexpected_item_ids=unexpected_ids,
+                    warning=response_warning,
+                )
                 if response_warning:
                     print(f"   ⚠️ {response_warning} O resíduo externo foi descartado.")
                 resolved_ids: list[int] = []
@@ -579,18 +913,66 @@ class FixedASSTranslator:
                     body = parsed.get(item_id)
                     if body is None:
                         errors[item_id] = "Item ausente ou duplicado na resposta."
+                        self._emit_trace(
+                            "item_rejected",
+                            **trace_context,
+                            item_id=item_id,
+                            reason=errors[item_id],
+                        )
                         continue
                     try:
                         restored = self._validate_model_body(handler, prepared, body)
                     except SubtitleValidationError as exc:
                         errors[item_id] = str(exc)
+                        if self._is_protected_line_break_error(prepared, errors[item_id]):
+                            line_break_recovery_eligible.add(item_id)
+                        self._emit_trace(
+                            "item_rejected",
+                            **trace_context,
+                            item_id=item_id,
+                            reason=errors[item_id],
+                        )
                         continue
                     outcomes[item_id - 1] = TranslationOutcome(restored)
                     resolved_ids.append(item_id)
+                    self._emit_trace(
+                        "item_accepted",
+                        **trace_context,
+                        item_id=item_id,
+                    )
                 for item_id in resolved_ids:
                     pending.pop(item_id, None)
 
+            single_item_id = pending_items[0][0] if len(pending_items) == 1 else None
+            if (
+                single_item_id is not None
+                and single_item_id in pending
+                and errors.get(single_item_id)
+                == "Item ausente ou duplicado na resposta."
+            ):
+                self._emit_trace(
+                    "individual_recovery_scheduled",
+                    mode="batch",
+                    batch_num=batch_num,
+                    total_batches=total_batches,
+                    attempt=attempt,
+                    item_ids=[single_item_id],
+                    items=trace_descriptors([single_item_id]),
+                    reason=errors[single_item_id],
+                )
+                break
+
             if pending and attempt < int(self.config["retry_count"]):
+                self._emit_trace(
+                    "retry_scheduled",
+                    mode="batch",
+                    batch_num=batch_num,
+                    total_batches=total_batches,
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    item_ids=sorted(pending),
+                    items=trace_descriptors(sorted(pending)),
+                )
                 await asyncio.sleep(float(self.config["retry_delay"]))
 
         if pending:
@@ -599,14 +981,35 @@ class FixedASSTranslator:
                 "com temperatura 0.0"
             )
         for item_id, prepared in list(pending.items()):
+            prompt = self._build_individual_prompt(item_id, prepared)
+            trace_context = {
+                "mode": "individual",
+                "batch_num": batch_num,
+                "total_batches": total_batches,
+                "attempt": 1,
+                "item_ids": [item_id],
+                "items": trace_descriptors([item_id]),
+            }
+            self._emit_trace(
+                "individual_attempt_started",
+                **trace_context,
+                temperature=0.0,
+                prompt=prompt,
+            )
             try:
                 response_text = await self._generate(
-                    self._build_individual_prompt(item_id, prepared),
+                    prompt,
                     temperature=0.0,
                 )
             except asyncio.TimeoutError:
                 errors[item_id] = (
                     f"Timeout após {self.config['timeout']}s na recuperação individual."
+                )
+                self._emit_trace(
+                    "model_error",
+                    **trace_context,
+                    error_type="TimeoutError",
+                    reason=errors[item_id],
                 )
                 continue
             except Exception as exc:
@@ -616,29 +1019,84 @@ class FixedASSTranslator:
                         "Encerrando para nova execução com um modelo válido."
                     ) from exc
                 errors[item_id] = f"Erro do Ollama na recuperação individual: {exc}"
+                self._emit_trace(
+                    "model_error",
+                    **trace_context,
+                    error_type=type(exc).__name__,
+                    reason=errors[item_id],
+                )
                 continue
 
-            parsed, response_warning = self._parse_item_response(response_text)
-            self._discard_unexpected_items(parsed, (item_id,))
+            self._emit_trace(
+                "model_response",
+                **trace_context,
+                response=response_text,
+            )
+            body, parsed_ids, response_warning, protocol_error = (
+                self._parse_individual_response(response_text, item_id)
+            )
+            unexpected_ids = sorted(set(parsed_ids) - {item_id})
+            self._emit_trace(
+                "response_parsed",
+                **trace_context,
+                parsed_item_ids=parsed_ids,
+                unexpected_item_ids=unexpected_ids,
+                warning=response_warning,
+            )
             if response_warning:
-                print(f"   ⚠️ {response_warning} O resíduo externo foi descartado.")
-            body = parsed.get(item_id)
-            if body is None:
-                errors[item_id] = "Item ausente ou duplicado na recuperação individual."
+                print(f"   ⚠️ {response_warning}")
+            if protocol_error is not None or body is None:
+                errors[item_id] = protocol_error or "Item ausente na recuperação individual."
+                self._emit_trace(
+                    "item_rejected",
+                    **trace_context,
+                    item_id=item_id,
+                    reason=errors[item_id],
+                )
                 continue
             try:
                 restored = self._validate_model_body(handler, prepared, body)
             except SubtitleValidationError as exc:
                 errors[item_id] = str(exc)
+                self._emit_trace(
+                    "item_rejected",
+                    **trace_context,
+                    item_id=item_id,
+                    reason=errors[item_id],
+                )
                 continue
             outcomes[item_id - 1] = TranslationOutcome(restored)
             pending.pop(item_id, None)
+            self._emit_trace(
+                "item_accepted",
+                **trace_context,
+                item_id=item_id,
+            )
+            self._emit_trace(
+                "individual_recovery_completed",
+                **trace_context,
+                item_id=item_id,
+            )
 
         for item_id, prepared in pending.items():
             error = errors.get(item_id, "Falha de tradução sem detalhe.")
             print(f"   ⚠️ Item {item_id:04d}: fallback para o original ({error})")
             outcomes[item_id - 1] = TranslationOutcome(
-                text=prepared.original_text, used_fallback=True, error=error
+                text=prepared.original_text,
+                used_fallback=True,
+                error=error,
+                line_break_recovery_eligible=item_id in line_break_recovery_eligible,
+            )
+            self._emit_trace(
+                "item_failed",
+                mode="fallback",
+                batch_num=batch_num,
+                total_batches=total_batches,
+                attempt=int(self.config["retry_count"]) + 1,
+                item_ids=[item_id],
+                items=trace_descriptors([item_id]),
+                item_id=item_id,
+                reason=error,
             )
 
         return [
@@ -674,7 +1132,17 @@ class FixedASSTranslator:
             for batch_num, batch in enumerate(batches, start=1):
                 prepared_items = [line["prepared"] for line in batch]
                 outcomes = await self.translate_single_batch(
-                    prepared_items, handler, batch_num, len(batches)
+                    prepared_items,
+                    handler,
+                    batch_num,
+                    len(batches),
+                    trace_items=[
+                        {
+                            "event_index": int(line["index"]),
+                            "text_hash": str(line["text_hash"]),
+                        }
+                        for line in batch
+                    ],
                 )
                 for line, outcome in zip(batch, outcomes):
                     line["translated_text"] = outcome.text
@@ -765,6 +1233,13 @@ class FixedASSTranslator:
                 f"A extensão de saída deve permanecer {handler.extension} para {source.name}."
             )
 
+        self._trace_file = str(source.resolve())
+        self._emit_trace(
+            "file_started",
+            output=str(destination.resolve()),
+            format=handler.format_name,
+        )
+
         print(f"\n{'=' * 60}")
         print(f"🎬 Iniciando tradução de legenda {handler.format_name.upper()}")
         print(f"📁 Arquivo: {source.name}")
@@ -782,6 +1257,12 @@ class FixedASSTranslator:
             print(
                 f"❌ Falha definitiva em {self.stats['failed']} item(ns). "
                 f"Nenhum novo output foi produzido para {source.name}."
+            )
+            self._emit_trace(
+                "file_failed",
+                output=str(destination.resolve()),
+                reason="incomplete_translation",
+                stats=dict(self.stats),
             )
             raise IncompleteTranslationError(self.stats["failed"])
         translations = {
@@ -812,7 +1293,15 @@ class FixedASSTranslator:
             f"puladas={self.stats['skipped']}, falhas={self.stats['failed']}"
         )
         print(f"⏱️ Tempo: {elapsed:.1f}s")
-        return dict(self.stats)
+        result = dict(self.stats)
+        self._emit_trace(
+            "file_completed",
+            output=str(destination.resolve()),
+            stats=result,
+            elapsed_seconds=elapsed,
+        )
+        self._trace_file = None
+        return result
 
 
 SubtitleTranslator = FixedASSTranslator

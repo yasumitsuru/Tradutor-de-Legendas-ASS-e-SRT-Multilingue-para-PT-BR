@@ -11,7 +11,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import ollama
 from tqdm import tqdm
@@ -182,7 +182,12 @@ def _add_stats(summary: dict[str, int], stats: dict[str, int]) -> None:
         summary[key] += int(stats.get(key, 0))
 
 
-async def main(argv: Sequence[str] | None = None) -> int:
+async def main(
+    argv: Sequence[str] | None = None,
+    *,
+    trace_hook: Callable[[dict[str, Any]], None] | None = None,
+    cache_file: str | Path | None = None,
+) -> int:
     """Validate CLI arguments and process every selected subtitle safely."""
 
     args = build_argument_parser().parse_args(argv)
@@ -221,7 +226,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         print(f"ℹ️ Arquivos ignorados: {', '.join(ignored_files)}")
     print(f"📤 Saída: {output_dir.resolve()}")
 
-    cache_path = Path(CONFIG["cache_file"])
+    cache_path = Path(cache_file) if cache_file is not None else Path(CONFIG["cache_file"])
     if args.clear_cache and cache_path.exists():
         try:
             cache_path.unlink()
@@ -238,8 +243,11 @@ async def main(argv: Sequence[str] | None = None) -> int:
         "timeout": args.timeout,
         "turbo_mode": args.turbo,
         "enable_cache": not args.no_cache,
+        "cache_file": str(cache_path),
         "allow_original_fallback": args.allow_original_fallback,
     }
+    if trace_hook is not None:
+        config["trace_hook"] = trace_hook
     if args.turbo:
         config["temperature"] = 0.15
         config["batch_size"] = min(config["batch_size"], 10)
