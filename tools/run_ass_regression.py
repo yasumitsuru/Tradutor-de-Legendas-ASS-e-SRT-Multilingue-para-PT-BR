@@ -321,8 +321,6 @@ async def run_experiment(args: argparse.Namespace) -> int:
         str(settings.model),
         "--backend",
         settings.backend,
-        "--api-base",
-        str(settings.api_base),
         "--source-language",
         str(args.source_language),
         "--batch-size",
@@ -332,6 +330,8 @@ async def run_experiment(args: argparse.Namespace) -> int:
         "--result-manifest",
         str(experiment_dir / "run_outputs.json"),
     ]
+    if settings.api_base is not None:
+        cli_argv.extend(["--api-base", settings.api_base])
     if args.no_cache:
         cli_argv.append("--no-cache")
     if args.turbo:

@@ -113,7 +113,7 @@ def test_runner_uses_production_cli_and_writes_isolated_reproducible_artifacts(
     assert (experiment / "trace.jsonl.gz").exists()
     assert "--format" in received_argv and "ass" in received_argv
     assert "--backend" in received_argv and "ollama" in received_argv
-    assert "--api-base" in received_argv
+    assert "--api-base" not in received_argv
     assert "--no-cache" in received_argv
     assert "--allow-original-fallback" not in received_argv
 
