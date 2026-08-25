@@ -13,6 +13,7 @@ from model_profiles import ModelProfile, get_model_profile
 
 DEFAULT_BACKEND = "ollama"
 DEFAULT_MODEL = "qwen2.5:14b"
+DEFAULT_LLAMA_SWAP_API_BASE = "http://127.0.0.1:9292/v1"
 
 
 @dataclass(frozen=True)

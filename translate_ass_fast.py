@@ -13,7 +13,14 @@ from typing import Any, Callable, Sequence
 
 from tqdm import tqdm
 
-from inference_backend import BackendModelNotFoundError
+from backend_config import (
+    DEFAULT_BACKEND,
+    DEFAULT_LLAMA_SWAP_API_BASE,
+    BackendSettings,
+    get_configured_model_profile,
+)
+from backend_factory import create_backend
+from inference_backend import BackendConfigurationError, BackendModelNotFoundError
 from run_manifest import initialize_run_manifest, record_run_output
 from subtitle_formats import (
     SUPPORTED_FORMATS,
@@ -66,6 +73,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "-o", "--output-dir", default="./saida", help="Pasta de saída das legendas traduzidas"
     )
     parser.add_argument("-m", "--model", default=CONFIG["model"], help="Modelo Ollama")
+    parser.add_argument(
+        "--backend",
+        choices=("ollama", "llama-swap"),
+        default=DEFAULT_BACKEND,
+        help="Backend de inferência: ollama ou llama-swap",
+    )
+    parser.add_argument(
+        "--api-base",
+        default=DEFAULT_LLAMA_SWAP_API_BASE,
+        help="Endpoint do backend (llama-swap: http://127.0.0.1:9292/v1)",
+    )
     parser.add_argument(
         "--source-language",
         default=CONFIG["source_language"],
@@ -187,8 +205,29 @@ async def main(
             return 1
         print("🗑️ Cache limpo!")
 
+    api_base = args.api_base
+    if args.backend == DEFAULT_BACKEND and api_base == DEFAULT_LLAMA_SWAP_API_BASE:
+        api_base = None
+    try:
+        settings = BackendSettings(
+            backend=args.backend,
+            api_base=api_base,
+            model=args.model,
+            batch_size=args.batch_size,
+            timeout=args.timeout,
+            enable_cache=not args.no_cache,
+            cache_file=str(cache_path),
+        )
+        backend = create_backend(settings)
+    except BackendConfigurationError as exc:
+        print(f"❌ Configuração do backend inválida: {exc}")
+        return 1
+
+    profile = get_configured_model_profile(settings)
+    profile_defaults = dict(profile.generation_defaults) if profile is not None else {}
     config: dict[str, Any] = {
         **CONFIG,
+        **profile_defaults,
         "model": args.model,
         "source_language": source_language,
         "batch_size": args.batch_size,
@@ -210,30 +249,34 @@ async def main(
     else:
         print(f"🌐 Idioma de origem informado: {config['source_language']}")
 
-    backend = OllamaBackend()
     try:
         try:
             backend.ensure_available(config["model"])
         except BackendModelNotFoundError as exc:
-            raise ModelUnavailableError(
-                f'❌ Modelo "{config["model"]}" não está disponível no Ollama. '
-                f"Instale antes com: ollama pull {config["model"]}"
-            ) from exc
+            if settings.backend == "ollama":
+                print(
+                    f'❌ Modelo "{config["model"]}" não está disponível no Ollama. '
+                    f"Instale antes com: ollama pull {config["model"]}"
+                )
+            else:
+                print(
+                    f'❌ Modelo "{config["model"]}" não está disponível no backend '
+                    f"{settings.backend}."
+                )
+            print("⛔ Encerrando backend para nova tentativa com um modelo válido.")
+            return 2
         except Exception as exc:
-            raise RuntimeError(f"❌ Não foi possível validar o modelo no Ollama: {exc}") from exc
-    except (ModelUnavailableError, RuntimeError) as exc:
-        print(str(exc))
-        print("⛔ Encerrando backend para nova tentativa com um modelo válido.")
-        return 2
+            print(f"❌ Não foi possível validar o modelo no backend {settings.backend}: {exc}")
+            print("⛔ Encerrando backend para nova tentativa com um modelo válido.")
+            return 2
 
-    translator = FixedASSTranslator(config, backend=backend)
-    season_started_at = datetime.now()
-    summary = _new_format_summary()
-    failed_files: list[str] = []
-    for format_name, count in counts.items():
-        summary[format_name]["files"] = count
+        translator = FixedASSTranslator(config, backend=backend)
+        season_started_at = datetime.now()
+        summary = _new_format_summary()
+        failed_files: list[str] = []
+        for format_name, count in counts.items():
+            summary[format_name]["files"] = count
 
-    try:
         for subtitle_file in tqdm(subtitle_files, desc="📦 Processando legendas", unit="arquivo"):
             format_name = subtitle_file.suffix.lower().removeprefix(".")
             output_file = preserve_extension_output_path(subtitle_file, output_dir)

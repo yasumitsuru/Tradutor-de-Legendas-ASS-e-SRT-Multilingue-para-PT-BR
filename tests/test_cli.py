@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 import translate_ass_fast
+from backend_config import DEFAULT_LLAMA_SWAP_API_BASE
+from inference_backend import BackendModelNotFoundError
 from run_manifest import load_run_outputs
 from translation_engine import IncompleteTranslationError
 
@@ -19,7 +21,11 @@ def available_ollama_backend(monkeypatch) -> None:
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(translate_ass_fast, "OllamaBackend", AvailableOllamaBackend)
+    monkeypatch.setattr(
+        translate_ass_fast,
+        "create_backend",
+        lambda _settings: AvailableOllamaBackend(),
+    )
 
 
 def test_cli_processes_both_formats_preserving_extension_and_reporting_counts(
@@ -162,7 +168,230 @@ def test_cli_original_fallback_defaults_false_and_is_propagated_when_enabled(
 
 
 def test_cli_keeps_the_existing_ollama_model_as_its_default() -> None:
-    assert translate_ass_fast.build_argument_parser().parse_args([]).model == "qwen2.5:14b"
+    args = translate_ass_fast.build_argument_parser().parse_args([])
+
+    assert (args.backend, args.api_base, args.model) == (
+        "ollama",
+        DEFAULT_LLAMA_SWAP_API_BASE,
+        "qwen2.5:14b",
+    )
+
+
+def test_cli_propagates_explicit_llama_swap_settings_to_the_selected_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    received_settings = []
+    translator_backends: list[object] = []
+
+    class FakeLlamaSwapBackend:
+        backend_id = "llama-swap"
+
+        def ensure_available(self, _model: str) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeTranslator:
+        def __init__(self, _config, *, backend) -> None:
+            translator_backends.append(backend)
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    backend = FakeLlamaSwapBackend()
+    monkeypatch.setattr(
+        translate_ass_fast,
+        "create_backend",
+        lambda settings: received_settings.append(settings) or backend,
+    )
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            [
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--backend",
+                "llama-swap",
+                "--api-base",
+                "http://localhost:9292/v1",
+                "--model",
+                "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+                "--no-cache",
+            ]
+        )
+    )
+
+    assert result == 0
+    assert len(received_settings) == 1
+    assert (
+        received_settings[0].backend,
+        received_settings[0].api_base,
+        received_settings[0].model,
+    ) == ("llama-swap", "http://localhost:9292/v1", "Qwen3.6-28B-REAP20-A3B-Q4_K_M")
+    assert translator_backends == [backend]
+
+
+def test_cli_preflights_the_selected_backend_before_processing_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    events: list[str] = []
+
+    class FakeBackend:
+        backend_id = "llama-swap"
+
+        def ensure_available(self, model: str) -> None:
+            events.append(f"preflight:{model}")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class FakeTranslator:
+        def __init__(self, _config, *, backend) -> None:
+            assert backend.backend_id == "llama-swap"
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            events.append("translate")
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "create_backend", lambda _settings: FakeBackend())
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            [
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--backend",
+                "llama-swap",
+                "--no-cache",
+            ]
+        )
+    )
+
+    assert result == 0
+    assert events == ["preflight:qwen2.5:14b", "translate", "close"]
+
+
+def test_cli_exits_for_a_missing_selected_backend_model_and_closes_it(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    closed: list[bool] = []
+
+    class MissingModelBackend:
+        backend_id = "llama-swap"
+
+        def ensure_available(self, _model: str) -> None:
+            raise BackendModelNotFoundError("missing")
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(translate_ass_fast, "create_backend", lambda _settings: MissingModelBackend())
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            [
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--backend",
+                "llama-swap",
+            ]
+        )
+    )
+
+    assert result == 2
+    assert closed == [True]
+    assert "Modelo \"qwen2.5:14b\" não está disponível no backend llama-swap." in capsys.readouterr().out
+
+
+def test_cli_closes_llama_swap_without_constructing_or_shutting_down_ollama(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    closed: list[bool] = []
+
+    class FakeLlamaSwapBackend:
+        backend_id = "llama-swap"
+
+        def ensure_available(self, _model: str) -> None:
+            return None
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class FakeTranslator:
+        def __init__(self, _config, *, backend) -> None:
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "create_backend", lambda _settings: FakeLlamaSwapBackend())
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+    monkeypatch.setattr(
+        translate_ass_fast,
+        "OllamaBackend",
+        lambda: pytest.fail("Ollama must not be constructed for llama-swap"),
+    )
+    monkeypatch.setattr(
+        translate_ass_fast,
+        "shutdown_ollama_model",
+        lambda _model: pytest.fail("Ollama shutdown must not run for llama-swap"),
+    )
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            [
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--backend",
+                "llama-swap",
+                "--no-cache",
+            ]
+        )
+    )
+
+    assert result == 0
+    assert closed == [True]
 
 
 def test_cli_source_language_defaults_to_auto_and_propagates_any_manual_value(
@@ -389,7 +618,7 @@ def test_cli_preflight_and_shutdown_use_the_same_selected_backend(
         def _save_cache(self) -> None:
             return None
 
-    monkeypatch.setattr(translate_ass_fast, "OllamaBackend", FakeBackend)
+    monkeypatch.setattr(translate_ass_fast, "create_backend", lambda _settings: FakeBackend())
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
 
     result = asyncio.run(
