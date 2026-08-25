@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from inference_backend import BackendConfigurationError
+from model_profiles import ModelProfile, get_model_profile
 
 
 DEFAULT_BACKEND = "ollama"
@@ -29,6 +30,12 @@ class BackendSettings:
     timeout: int = 300
     enable_cache: bool = True
     cache_file: str = "translation_cache.json"
+
+
+def get_configured_model_profile(settings: BackendSettings) -> ModelProfile | None:
+    """Return the registered profile for these settings, if one is known."""
+
+    return get_model_profile(settings.backend, settings.model)
 
 
 def _parse_http_url(raw: str, *, allow_missing_scheme: bool) -> tuple[str, str]:

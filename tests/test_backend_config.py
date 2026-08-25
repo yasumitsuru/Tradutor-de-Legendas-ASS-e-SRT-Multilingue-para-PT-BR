@@ -8,6 +8,9 @@ import pytest
 
 from backend_config import (
     BackendSettings,
+    DEFAULT_BACKEND,
+    DEFAULT_MODEL,
+    get_configured_model_profile,
     load_backend_settings,
     normalize_backend_endpoint,
     save_backend_settings,
@@ -64,6 +67,14 @@ def test_load_backend_settings_defaults_to_local_ollama_and_existing_model(tmp_p
     assert settings.model == "qwen2.5:14b"
     assert settings.batch_size == 15
     assert settings.timeout == 300
+
+
+def test_default_backend_settings_remain_ollama_without_the_experimental_profile() -> None:
+    settings = BackendSettings()
+
+    assert (DEFAULT_BACKEND, DEFAULT_MODEL) == ("ollama", "qwen2.5:14b")
+    assert (settings.backend, settings.model) == (DEFAULT_BACKEND, DEFAULT_MODEL)
+    assert get_configured_model_profile(settings) is None
 
 
 def test_load_backend_settings_migrates_legacy_local_and_remote_ollama_values(tmp_path) -> None:
