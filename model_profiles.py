@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import FrozenSet, Mapping
 
 
@@ -17,6 +18,7 @@ UNVALIDATED = "UNVALIDATED"
 NOT_PRODUCTION_APPROVED = "NOT_PRODUCTION_APPROVED"
 
 QWEN36_MODEL_ID = "Qwen3.6-28B-REAP20-A3B-Q4_K_M"
+SUPPORTED_BACKEND_IDS = frozenset({"ollama", "llama-swap"})
 
 
 @dataclass(frozen=True)
@@ -54,7 +56,7 @@ QWEN36_PROFILE = ModelProfile(
             NOT_PRODUCTION_APPROVED,
         }
     ),
-    generation_defaults={},
+    generation_defaults=MappingProxyType({}),
     max_parallel=None,
     provenance="registered",
 )
@@ -81,7 +83,9 @@ def select_model(backend: str, model: str, *, discovered: bool = False) -> Model
             provenance=profile.provenance,
         )
 
-    status = {BACKEND_SUPPORTED}
+    status = set()
+    if backend in SUPPORTED_BACKEND_IDS:
+        status.add(BACKEND_SUPPORTED)
     if discovered:
         status.add(MODEL_DISCOVERED)
     return ModelSelection(
