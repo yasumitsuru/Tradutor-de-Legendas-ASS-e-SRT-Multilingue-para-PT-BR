@@ -30,6 +30,14 @@ def _arguments(tmp_path: Path, input_dir: Path, *extra: str) -> argparse.Namespa
     )
 
 
+class _AvailableBackend:
+    def __init__(self) -> None:
+        self.models: list[str] = []
+
+    def ensure_available(self, model: str) -> None:
+        self.models.append(model)
+
+
 def test_runner_defaults_match_safe_real_baseline() -> None:
     args = runner.build_argument_parser().parse_args([])
 
@@ -86,8 +94,9 @@ def test_runner_uses_production_cli_and_writes_isolated_reproducible_artifacts(
             trace_hook({"event": "item_accepted", "item_id": 1, "mode": "batch"})
         return 0
 
+    backend = _AvailableBackend()
     monkeypatch.setattr(runner, "translation_cli_main", fake_translation_main)
-    monkeypatch.setattr(runner, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(runner, "create_backend", lambda _settings: backend, raising=False)
 
     exit_code = asyncio.run(runner.run_experiment(_arguments(tmp_path, input_dir)))
 
@@ -103,11 +112,21 @@ def test_runner_uses_production_cli_and_writes_isolated_reproducible_artifacts(
     assert (experiment / "run.log").exists()
     assert (experiment / "trace.jsonl.gz").exists()
     assert "--format" in received_argv and "ass" in received_argv
+    assert "--backend" in received_argv and "ollama" in received_argv
+    assert "--api-base" in received_argv
     assert "--no-cache" in received_argv
     assert "--allow-original-fallback" not in received_argv
 
     context = json.loads((experiment / "context.json").read_text(encoding="utf-8"))
     assert context["model"] == CONFIG["model"]
+    assert context["backend"] == "ollama"
+    assert context["api_base"] is None
+    assert context["model_profile"] == {
+        "known": False,
+        "provenance": "user-provided",
+        "status": ["BACKEND_SUPPORTED"],
+    }
+    assert context["generation_parameters"]["temperature"] == CONFIG["temperature"]
     assert context["batch_size"] == CONFIG["batch_size"]
     assert context["cache_enabled"] is False
     assert context["turbo"] is False
@@ -141,7 +160,9 @@ def test_with_cache_uses_only_an_experiment_local_cache(
         return 1
 
     monkeypatch.setattr(runner, "translation_cli_main", fake_translation_main)
-    monkeypatch.setattr(runner, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        runner, "create_backend", lambda _settings: _AvailableBackend(), raising=False
+    )
 
     result = asyncio.run(
         runner.run_experiment(_arguments(tmp_path, input_dir, "--with-cache"))
@@ -173,7 +194,9 @@ def test_runner_never_overwrites_an_existing_experiment(
     (input_dir / "episode.ass").write_bytes(
         (FIXTURES / "regression_ass_cases.ass").read_bytes()
     )
-    monkeypatch.setattr(runner, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        runner, "create_backend", lambda _settings: _AvailableBackend(), raising=False
+    )
 
     async def no_op_translation(_argv, *, trace_hook=None, cache_file=None) -> int:
         return 0
@@ -200,7 +223,11 @@ def test_runner_reports_unavailable_ollama_as_not_executed(
     def unavailable(_model: str) -> None:
         raise ModelUnavailableError("model unavailable")
 
-    monkeypatch.setattr(runner, "ensure_ollama_model_available", unavailable)
+    class UnavailableBackend:
+        def ensure_available(self, model: str) -> None:
+            unavailable(model)
+
+    monkeypatch.setattr(runner, "create_backend", lambda _settings: UnavailableBackend(), raising=False)
 
     exit_code = asyncio.run(runner.run_experiment(_arguments(tmp_path, input_dir)))
 
@@ -224,7 +251,9 @@ def test_runner_reports_late_model_unavailability_as_not_executed(
         return runner.EXIT_OLLAMA_UNAVAILABLE
 
     monkeypatch.setattr(runner, "translation_cli_main", late_unavailable)
-    monkeypatch.setattr(runner, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        runner, "create_backend", lambda _settings: _AvailableBackend(), raising=False
+    )
 
     exit_code = asyncio.run(runner.run_experiment(_arguments(tmp_path, input_dir)))
 
@@ -249,7 +278,9 @@ def test_source_removed_during_run_is_reported_instead_of_aborting(
         return 1
 
     monkeypatch.setattr(runner, "translation_cli_main", remove_source)
-    monkeypatch.setattr(runner, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        runner, "create_backend", lambda _settings: _AvailableBackend(), raising=False
+    )
 
     exit_code = asyncio.run(runner.run_experiment(_arguments(tmp_path, input_dir)))
 
@@ -265,3 +296,78 @@ def test_source_removed_during_run_is_reported_instead_of_aborting(
     assert "SOURCE_MUTATED" in categories
     assert context["source_integrity_preserved"] is False
     assert context["source_integrity_errors"]
+
+
+def test_runner_uses_selected_llama_swap_for_preflight_and_delegates_endpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_bytes(
+        (FIXTURES / "regression_ass_cases.ass").read_bytes()
+    )
+    received_settings = []
+    received_argv: list[str] = []
+
+    class LlamaSwapBackend:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+            self.close_calls = 0
+
+        def ensure_available(self, model: str) -> None:
+            self.models.append(model)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    backend = LlamaSwapBackend()
+
+    def create_selected_backend(settings):
+        received_settings.append(settings)
+        return backend
+
+    async def production_cli(argv, *, trace_hook=None, cache_file=None) -> int:
+        received_argv.extend(argv)
+        return 0
+
+    monkeypatch.setattr(runner, "create_backend", create_selected_backend, raising=False)
+    monkeypatch.setattr(runner, "translation_cli_main", production_cli)
+
+    result = asyncio.run(
+        runner.run_experiment(
+            _arguments(
+                tmp_path,
+                input_dir,
+                "--backend",
+                "llama-swap",
+                "--api-base",
+                "http://127.0.0.1:9292/v1",
+                "--model",
+                "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+            )
+        )
+    )
+
+    experiment = tmp_path / "test_results" / "20260813_120000" / "baseline"
+    context = json.loads((experiment / "context.json").read_text(encoding="utf-8"))
+    assert result == runner.EXIT_CRITICAL_FAILURE
+    assert received_settings[0].backend == "llama-swap"
+    assert received_settings[0].api_base == "http://127.0.0.1:9292/v1"
+    assert backend.models == ["Qwen3.6-28B-REAP20-A3B-Q4_K_M"]
+    assert backend.close_calls == 0
+    assert received_argv[received_argv.index("--backend") + 1] == "llama-swap"
+    assert received_argv[received_argv.index("--api-base") + 1] == "http://127.0.0.1:9292/v1"
+    assert context["backend"] == "llama-swap"
+    assert context["api_base"] == "http://127.0.0.1:9292/v1"
+    assert context["model_profile"] == {
+        "known": True,
+        "provenance": "registered",
+        "status": [
+            "BACKEND_SUPPORTED",
+            "EXPERIMENTAL",
+            "MODEL_DISCOVERED",
+            "MODEL_PROFILE_KNOWN",
+            "NOT_PRODUCTION_APPROVED",
+            "UNVALIDATED",
+        ],
+    }

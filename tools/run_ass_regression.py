@@ -32,13 +32,19 @@ from ass_regression import (  # noqa: E402
     write_json,
     write_reports,
 )
+from backend_config import (  # noqa: E402
+    DEFAULT_BACKEND,
+    DEFAULT_LLAMA_SWAP_API_BASE,
+    BackendSettings,
+    get_configured_model_profile,
+    normalize_backend_endpoint,
+)
+from backend_factory import create_backend  # noqa: E402
+from inference_backend import BackendConfigurationError  # noqa: E402
+from model_profiles import select_model  # noqa: E402
 from subtitle_formats import preserve_extension_output_path  # noqa: E402
 from translate_ass_fast import main as translation_cli_main  # noqa: E402
-from translation_engine import (  # noqa: E402
-    CONFIG,
-    ModelUnavailableError,
-    ensure_ollama_model_available,
-)
+from translation_engine import CONFIG  # noqa: E402
 
 
 EXIT_CRITICAL_FAILURE = 1
@@ -66,12 +72,18 @@ class _Tee:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Bateria manual de regressão ASS usando o Ollama e a CLI de produção"
+        description="Bateria manual de regressão ASS usando o backend selecionado e a CLI de produção"
     )
     parser.add_argument("--input-dir", type=Path, default=Path("entrada"))
     parser.add_argument("--file", type=Path, dest="input_file")
     parser.add_argument("--output-dir", type=Path, default=Path("test_results"))
     parser.add_argument("--model", default=CONFIG["model"])
+    parser.add_argument(
+        "--backend",
+        choices=("ollama", "llama-swap"),
+        default=DEFAULT_BACKEND,
+    )
+    parser.add_argument("--api-base", default=DEFAULT_LLAMA_SWAP_API_BASE)
     parser.add_argument("--batch-size", type=int, default=CONFIG["batch_size"])
     parser.add_argument("--timeout", type=int, default=CONFIG["timeout"])
     parser.add_argument("--source-language", default=CONFIG["source_language"])
@@ -93,20 +105,50 @@ def _safe_component(value: str, label: str) -> str:
     return value
 
 
-def _effective_context(args: argparse.Namespace, file_count: int) -> dict[str, Any]:
+def _effective_settings(args: argparse.Namespace, cache_file: Path | None) -> BackendSettings:
+    api_base = args.api_base
+    if args.backend == DEFAULT_BACKEND and api_base == DEFAULT_LLAMA_SWAP_API_BASE:
+        api_base = None
+    endpoint = normalize_backend_endpoint(args.backend, api_base)
+    return BackendSettings(
+        backend=args.backend,
+        api_base=endpoint.api_base,
+        model=args.model,
+        batch_size=args.batch_size,
+        timeout=args.timeout,
+        enable_cache=not args.no_cache,
+        cache_file=str(cache_file) if cache_file is not None else CONFIG["cache_file"],
+    )
+
+
+def _effective_context(
+    args: argparse.Namespace, file_count: int, settings: BackendSettings
+) -> dict[str, Any]:
+    profile = get_configured_model_profile(settings)
+    generation_config = {**CONFIG}
+    if profile is not None:
+        generation_config.update(profile.generation_defaults)
     effective_batch = min(args.batch_size, 10) if args.turbo else args.batch_size
-    effective_temperature = 0.15 if args.turbo else float(CONFIG["temperature"])
-    system_prompt = str(CONFIG["system_prompt"])
+    effective_temperature = 0.15 if args.turbo else float(generation_config["temperature"])
+    system_prompt = str(generation_config["system_prompt"])
+    selection = select_model(settings.backend, settings.model)
     return {
-        "model": args.model,
-        "ollama_parameters": {
+        "backend": settings.backend,
+        "api_base": settings.api_base,
+        "model": settings.model,
+        "model_profile": {
+            "known": selection.profile is not None,
+            "status": sorted(selection.status),
+            "provenance": selection.provenance,
+        },
+        "generation_parameters": {
             "temperature": effective_temperature,
-            "num_predict": CONFIG["max_tokens"],
-            "num_ctx": CONFIG.get("num_ctx"),
+            "num_predict": generation_config["max_tokens"],
+            "num_ctx": generation_config.get("num_ctx"),
             "top_p": 0.9,
             "timeout_seconds": args.timeout,
-            "retry_count": CONFIG["retry_count"],
-            "retry_delay_seconds": CONFIG["retry_delay"],
+            "retry_count": generation_config["retry_count"],
+            "retry_delay_seconds": generation_config["retry_delay"],
         },
         "batch_size_requested": args.batch_size,
         "batch_size": effective_batch,
@@ -114,8 +156,8 @@ def _effective_context(args: argparse.Namespace, file_count: int) -> dict[str, A
         "cache_enabled": not args.no_cache,
         "allow_original_fallback": False,
         "source_language": args.source_language,
-        "target_language": CONFIG["target_language"],
-        "prompt_version": CONFIG["prompt_version"],
+        "target_language": generation_config["target_language"],
+        "prompt_version": generation_config["prompt_version"],
         "system_prompt_sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
         "files": file_count,
     }
@@ -223,9 +265,18 @@ async def run_experiment(args: argparse.Namespace) -> int:
         return EXIT_CONFIGURATION_ERROR
     write_json(experiment_dir / "sources.json", {"files": source_manifest})
 
+    try:
+        settings = _effective_settings(args, isolated_cache_path)
+    except BackendConfigurationError as exc:
+        write_json(
+            experiment_dir / "preflight_error.json",
+            {"status": "NOT_EXECUTED", "reason": str(exc)},
+        )
+        return EXIT_CONFIGURATION_ERROR
+
     context = {
         **collect_runtime_metadata(PROJECT_ROOT),
-        **_effective_context(args, len(sources)),
+        **_effective_context(args, len(sources), settings),
         "experiment": experiment,
         "run_id": run_id,
         "input_dir": str(args.input_dir.resolve()),
@@ -240,9 +291,17 @@ async def run_experiment(args: argparse.Namespace) -> int:
     write_json(experiment_dir / "context.json", context)
 
     try:
-        ensure_ollama_model_available(args.model)
-    except (ModelUnavailableError, RuntimeError) as exc:
-        failure = {"status": "NOT_EXECUTED", "reason": str(exc), "model": args.model}
+        create_backend(settings).ensure_available(settings.model)
+    except BackendConfigurationError as exc:
+        failure = {"status": "NOT_EXECUTED", "reason": str(exc), "model": settings.model}
+        context.update(failure)
+        context["completed_at"] = datetime.now().astimezone().isoformat()
+        write_json(experiment_dir / "context.json", context)
+        write_json(experiment_dir / "preflight_error.json", failure)
+        print(f"❌ Configuração do backend inválida: {exc}")
+        return EXIT_CONFIGURATION_ERROR
+    except Exception as exc:
+        failure = {"status": "NOT_EXECUTED", "reason": str(exc), "model": settings.model}
         context.update(failure)
         context["completed_at"] = datetime.now().astimezone().isoformat()
         write_json(experiment_dir / "context.json", context)
@@ -259,7 +318,11 @@ async def run_experiment(args: argparse.Namespace) -> int:
         "--format",
         "ass",
         "--model",
-        str(args.model),
+        str(settings.model),
+        "--backend",
+        settings.backend,
+        "--api-base",
+        str(args.api_base),
         "--source-language",
         str(args.source_language),
         "--batch-size",
