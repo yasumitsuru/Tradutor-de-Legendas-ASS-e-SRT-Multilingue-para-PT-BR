@@ -161,6 +161,10 @@ def test_cli_original_fallback_defaults_false_and_is_propagated_when_enabled(
     assert received_configs[0]["allow_original_fallback"] is True
 
 
+def test_cli_keeps_the_existing_ollama_model_as_its_default() -> None:
+    assert translate_ass_fast.build_argument_parser().parse_args([]).model == "qwen2.5:14b"
+
+
 def test_cli_source_language_defaults_to_auto_and_propagates_any_manual_value(
     tmp_path: Path, monkeypatch
 ) -> None:
