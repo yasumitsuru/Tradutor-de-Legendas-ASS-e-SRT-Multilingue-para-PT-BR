@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -13,10 +12,18 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-from urllib import parse as urlparse
 
 import flet as ft
 
+from backend_config import (
+    BackendSettings,
+    DEFAULT_BACKEND,
+    DEFAULT_MODEL,
+    load_backend_settings,
+    normalize_backend_endpoint,
+    save_backend_settings,
+)
+from inference_backend import BackendConfigurationError
 from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import is_supported_subtitle, iter_subtitle_files
 
@@ -48,13 +55,12 @@ CONFIG_PATH = BASE_DIR / "web_config.json"
 LOCAL_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 DEFAULT_FORM_VALUES: dict[str, str] = {
-    "model": "qwen2.5:14b",
+    "backend": DEFAULT_BACKEND,
+    "api_base": "",
+    "model": DEFAULT_MODEL,
     "batch_size": "15",
     "timeout": "300",
-    "ollama_mode": "local",
-    "ollama_endpoint": "",
 }
-CONFIG_KEYS = ("model", "batch_size", "timeout", "ollama_mode", "ollama_endpoint")
 
 
 def _run_manifest_path() -> Path:
@@ -73,40 +79,6 @@ _BATCH_PROGRESS_RE = re.compile(r"Batch\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 def _sanitize_logs(text: str) -> str:
     return _PATH_SANITIZER.sub("[caminho oculto]", text)
-
-
-def _normalize_ollama_connection(
-    mode_raw: str,
-    endpoint_raw: str,
-) -> tuple[bool, str, str, str | None, str]:
-    mode = (mode_raw or "local").strip().lower()
-    if mode not in {"local", "remote"}:
-        return False, "", "", None, "Tipo de conexão Ollama inválido."
-
-    endpoint = (endpoint_raw or "").strip()
-    if mode == "local":
-        return True, "local", "", None, ""
-    if not endpoint:
-        return False, "", "", None, "Informe IP:porta ou URL do Ollama remoto."
-
-    candidate = endpoint
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", candidate):
-        candidate = f"http://{candidate}"
-
-    try:
-        parsed = urlparse.urlparse(candidate)
-    except Exception:
-        return False, "", "", None, "Endpoint Ollama remoto inválido."
-
-    if parsed.scheme not in {"http", "https"}:
-        return False, "", "", None, "Use apenas endpoints http:// ou https://."
-    if not parsed.hostname:
-        return False, "", "", None, "Endpoint Ollama remoto inválido."
-    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-        return False, "", "", None, "Use somente host e porta, sem caminho ou consulta."
-
-    normalized_endpoint = f"{parsed.scheme}://{parsed.netloc}"
-    return True, "remote", normalized_endpoint, normalized_endpoint, ""
 
 
 def _normalize_config(form: dict[str, str]) -> tuple[bool, dict[str, str], str]:
@@ -128,41 +100,46 @@ def _normalize_config(form: dict[str, str]) -> tuple[bool, dict[str, str], str]:
     if not 10 <= timeout <= 100000:
         return False, {}, "Timeout deve ficar entre 10 e 100000 segundos."
 
-    ok, mode, endpoint, _, error = _normalize_ollama_connection(
-        form.get("ollama_mode", "local"),
-        form.get("ollama_endpoint", ""),
-    )
-    if not ok:
-        return False, {}, error
+    backend = form.get("backend", DEFAULT_BACKEND).strip()
+    try:
+        endpoint = normalize_backend_endpoint(backend, form.get("api_base", ""))
+    except BackendConfigurationError as exc:
+        return False, {}, str(exc)
 
     return True, {
+        "backend": backend,
+        "api_base": endpoint.api_base or "",
         "model": model,
         "batch_size": str(batch_size),
         "timeout": str(timeout),
-        "ollama_mode": mode,
-        "ollama_endpoint": endpoint,
     }, ""
 
 
 def _load_user_config() -> dict[str, str]:
-    if not CONFIG_PATH.exists():
-        return {}
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return {}
-        values = {key: str(raw.get(key, "")).strip() for key in CONFIG_KEYS}
-        ok, normalized, _ = _normalize_config(values)
-        return normalized if ok else {}
-    except Exception:
+        settings = load_backend_settings(CONFIG_PATH)
+    except (BackendConfigurationError, OSError):
         return {}
+    return {
+        "backend": settings.backend,
+        "api_base": settings.api_base or "",
+        "model": settings.model,
+        "batch_size": str(settings.batch_size),
+        "timeout": str(settings.timeout),
+    }
 
 
 def _save_user_config(config: dict[str, str]) -> None:
-    payload = {key: config[key] for key in CONFIG_KEYS}
-    CONFIG_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    save_backend_settings(
+        CONFIG_PATH,
+        BackendSettings(
+            backend=config["backend"],
+            api_base=config["api_base"] or None,
+            model=config["model"],
+            batch_size=int(config["batch_size"]),
+            timeout=int(config["timeout"]),
+            cache_file=str(CACHE_PATH),
+        ),
     )
 
 
@@ -236,6 +213,10 @@ def _build_command(form: dict[str, str]) -> list[str]:
             str(ENTRY_DIR),
             "--output-dir",
             str(OUTPUT_DIR),
+            "--backend",
+            form.get("backend", DEFAULT_BACKEND),
+            "--api-base",
+            form.get("api_base", ""),
             "--model",
             form["model"],
             "--batch-size",
@@ -377,28 +358,26 @@ class TranslatorFletApp:
             bgcolor=CARD_BG,
         )
         self.model_input = ft.TextField(
-            label="Modelo Ollama",
+            label="Modelo",
             value=defaults["model"],
             prefix_icon=ft.Icons.MEMORY_ROUNDED,
             **field_style,
         )
-        self.connection_input = ft.Dropdown(
-            label="Conexão Ollama",
-            value=defaults["ollama_mode"],
+        self.backend_input = ft.Dropdown(
+            label="Backend",
+            value=defaults["backend"],
             options=[
-                ft.DropdownOption(key="local", text="Local — neste computador"),
-                ft.DropdownOption(key="remote", text="Remota — IP ou URL"),
+                ft.DropdownOption(key="ollama", text="Ollama"),
+                ft.DropdownOption(key="llama-swap", text="llama-swap"),
             ],
-            on_select=self._on_connection_change,
             leading_icon=ft.Icons.LAN_ROUNDED,
             **field_style,
         )
         self.endpoint_input = ft.TextField(
-            label="IP:porta ou URL/DNS",
-            value=defaults["ollama_endpoint"],
-            hint_text="192.168.1.10:11434",
+            label="API base",
+            value=defaults["api_base"],
+            hint_text="http://127.0.0.1:9292/v1",
             prefix_icon=ft.Icons.LINK_ROUNDED,
-            disabled=defaults["ollama_mode"] != "remote",
             **field_style,
         )
         self.batch_input = ft.TextField(
@@ -632,7 +611,7 @@ class TranslatorFletApp:
             ft.Column(
                 [
                     self.model_input,
-                    self.connection_input,
+                    self.backend_input,
                     self.endpoint_input,
                     ft.ResponsiveRow([self.batch_input, self.timeout_input], spacing=10, run_spacing=10),
                     ft.Row(
@@ -830,17 +809,16 @@ class TranslatorFletApp:
         self.model_input.value = values["model"]
         self.batch_input.value = values["batch_size"]
         self.timeout_input.value = values["timeout"]
-        self.connection_input.value = values["ollama_mode"]
-        self.endpoint_input.value = values["ollama_endpoint"]
-        self.endpoint_input.disabled = values["ollama_mode"] != "remote"
+        self.backend_input.value = values["backend"]
+        self.endpoint_input.value = values["api_base"]
 
     def _collect_form(self) -> dict[str, str]:
         return {
             "model": self.model_input.value or "",
             "batch_size": self.batch_input.value or "",
             "timeout": self.timeout_input.value or "",
-            "ollama_mode": self.connection_input.value or "local",
-            "ollama_endpoint": self.endpoint_input.value or "",
+            "backend": self.backend_input.value or DEFAULT_BACKEND,
+            "api_base": self.endpoint_input.value or "",
         }
 
     def _file_rows(self, files: list[Path], empty_text: str, icon: Any) -> list[ft.Control]:
@@ -968,13 +946,6 @@ class TranslatorFletApp:
         )
         self.page.show_dialog(dialog)
 
-    def _on_connection_change(self, _: Any) -> None:
-        remote = self.connection_input.value == "remote"
-        self.endpoint_input.disabled = not remote
-        if not remote:
-            self.endpoint_input.value = ""
-        self.page.update()
-
     def _on_no_cache_change(self, _: Any) -> None:
         self.clear_cache_check.disabled = bool(self.no_cache_check.value)
         if self.no_cache_check.value:
@@ -1069,7 +1040,11 @@ class TranslatorFletApp:
                 self.allow_original_fallback_check.value
             ),
         }
-        ollama_host = normalized["ollama_endpoint"] if normalized["ollama_mode"] == "remote" else None
+        ollama_host = (
+            normalized["api_base"]
+            if normalized["backend"] == "ollama" and normalized["api_base"]
+            else None
+        )
 
         with self._lock:
             self._running = True
@@ -1093,18 +1068,19 @@ class TranslatorFletApp:
             )
             return
         self._set_running_ui(True, "Validando")
-        self._append_log("[Flet] Validando conexão e modelo no Ollama...")
+        self._append_log(f"[Flet] Validando backend {normalized['backend']}...")
         self._update_progress()
         self.page.run_thread(self._run_translation, full_form, ollama_host)
 
     def _run_translation(self, form: dict[str, Any], ollama_host: str | None) -> None:
         return_code = -1
         try:
-            available, model_error = _ensure_ollama_model_available(form["model"], ollama_host)
-            if not available:
-                self._append_log(f"[Flet] {model_error}")
-                self._finish_translation(2, model_error)
-                return
+            if form["backend"] == "ollama":
+                available, model_error = _ensure_ollama_model_available(form["model"], ollama_host)
+                if not available:
+                    self._append_log(f"[Flet] {model_error}")
+                    self._finish_translation(2, model_error)
+                    return
             with self._lock:
                 if self._cancel_requested:
                     self._finish_translation(1)
@@ -1112,8 +1088,8 @@ class TranslatorFletApp:
 
             self._set_running_ui(True, "Executando")
             command = _build_command(form)
-            endpoint_label = ollama_host or "local"
-            self._append_log(f"[Flet] Ollama: {endpoint_label}")
+            endpoint_label = form["api_base"] or "local"
+            self._append_log(f"[Flet] Backend: {form['backend']} ({endpoint_label})")
             self._append_log(f"[Flet] Comando: {_sanitize_logs(' '.join(command))}")
 
             env = dict(os.environ)

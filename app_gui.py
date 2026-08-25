@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-import json
 import shutil
 import hashlib
 import subprocess
@@ -16,6 +15,15 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
+from backend_config import (
+    BackendSettings,
+    DEFAULT_BACKEND,
+    DEFAULT_MODEL,
+    load_backend_settings,
+    normalize_backend_endpoint,
+    save_backend_settings,
+)
+from inference_backend import BackendConfigurationError
 from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import is_supported_subtitle, iter_subtitle_files
 
@@ -90,13 +98,12 @@ LOCAL_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_FORM_VALUES: dict[str, str] = {
     "input_dir": str(ENTRY_DIR),
     "output_dir": str(OUTPUT_DIR),
-    "model": "qwen2.5:14b",
+    "backend": DEFAULT_BACKEND,
+    "api_base": "",
+    "model": DEFAULT_MODEL,
     "batch_size": "15",
     "timeout": "300",
-    "ollama_mode": "local",
-    "ollama_endpoint": "",
 }
-CONFIG_KEYS = ("model", "batch_size", "timeout", "ollama_mode", "ollama_endpoint")
 
 
 def _run_manifest_path() -> Path:
@@ -121,55 +128,10 @@ def _validate_model(name: str) -> bool:
     return bool(name) and bool(_ALLOWED_MODEL_RE.match(name))
 
 
-def _normalize_ollama_connection(
-    mode_raw: str,
-    endpoint_raw: str,
-) -> tuple[bool, str, str, str | None, str]:
-    from urllib import parse as urlparse
-
-    mode = (mode_raw or "local").strip().lower()
-    if mode not in {"local", "remote"}:
-        return False, "", "", None, "Tipo de conexao Ollama invalido."
-
-    endpoint = (endpoint_raw or "").strip()
-    if mode == "local":
-        return True, "local", "", None, ""
-
-    if not endpoint:
-        return (
-            False,
-            "",
-            "",
-            None,
-            "Informe IP:porta ou URL/DNS para o Ollama remoto.",
-        )
-
-    candidate = endpoint
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", candidate):
-        candidate = f"http://{candidate}"
-
-    try:
-        parsed = urlparse.urlparse(candidate)
-    except Exception:
-        return False, "", "", None, "Endpoint Ollama remoto invalido."
-
-    if parsed.scheme not in {"http", "https"}:
-        return False, "", "", None, "Use apenas endpoints http:// ou https://."
-    if not parsed.hostname:
-        return False, "", "", None, "Endpoint Ollama remoto invalido."
-    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-        return False, "", "", None, "Use apenas host e porta (sem path ou query)."
-
-    normalized_endpoint = f"{parsed.scheme}://{parsed.netloc}"
-    return True, "remote", normalized_endpoint, normalized_endpoint, ""
-
-
 def _normalize_config(form_like: dict[str, str]) -> tuple[bool, dict[str, str], str]:
     model = form_like.get("model", "").strip()
     batch_size = form_like.get("batch_size", "").strip()
     timeout = form_like.get("timeout", "").strip()
-    ollama_mode = form_like.get("ollama_mode", "local").strip()
-    ollama_endpoint = form_like.get("ollama_endpoint", "").strip()
 
     if not _validate_model(model):
         return False, {}, "Nome de modelo invalido."
@@ -188,41 +150,48 @@ def _normalize_config(form_like: dict[str, str]) -> tuple[bool, dict[str, str], 
     if timeout_num < 10:
         return False, {}, "Timeout deve ser maior ou igual a 10 segundos."
 
-    conn_ok, normalized_mode, normalized_endpoint, _, conn_error = (
-        _normalize_ollama_connection(ollama_mode, ollama_endpoint)
-    )
-    if not conn_ok:
-        return False, {}, conn_error
+    backend = form_like.get("backend", DEFAULT_BACKEND).strip()
+    try:
+        endpoint = normalize_backend_endpoint(backend, form_like.get("api_base", ""))
+    except BackendConfigurationError as exc:
+        return False, {}, str(exc)
 
     normalized = {
+        "backend": backend,
+        "api_base": endpoint.api_base or "",
         "model": model,
         "batch_size": str(batch_num),
         "timeout": str(timeout_num),
-        "ollama_mode": normalized_mode,
-        "ollama_endpoint": normalized_endpoint,
     }
     return True, normalized, ""
 
 
 def _load_user_config() -> dict[str, str]:
-    if not WEB_CONFIG_PATH.exists():
-        return {}
     try:
-        with WEB_CONFIG_PATH.open("r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-        if not isinstance(raw, dict):
-            return {}
-        raw_config = {key: str(raw.get(key, "")).strip() for key in CONFIG_KEYS}
-        ok, normalized, _ = _normalize_config(raw_config)
-        return normalized if ok else {}
-    except Exception:
+        settings = load_backend_settings(WEB_CONFIG_PATH)
+    except (BackendConfigurationError, OSError):
         return {}
+    return {
+        "backend": settings.backend,
+        "api_base": settings.api_base or "",
+        "model": settings.model,
+        "batch_size": str(settings.batch_size),
+        "timeout": str(settings.timeout),
+    }
 
 
 def _save_user_config(config: dict[str, str]) -> None:
-    payload = {key: config[key] for key in CONFIG_KEYS}
-    with WEB_CONFIG_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    save_backend_settings(
+        WEB_CONFIG_PATH,
+        BackendSettings(
+            backend=config["backend"],
+            api_base=config["api_base"] or None,
+            model=config["model"],
+            batch_size=int(config["batch_size"]),
+            timeout=int(config["timeout"]),
+            cache_file=str(CACHE_PATH),
+        ),
+    )
 
 
 def _effective_defaults() -> dict[str, str]:
@@ -312,7 +281,11 @@ def _build_command(form: dict[str, str]) -> list[str]:
             form["input_dir"],
             "--output-dir",
             form["output_dir"],
-            "-m",
+            "--backend",
+            form.get("backend", DEFAULT_BACKEND),
+            "--api-base",
+            form.get("api_base", ""),
+            "--model",
             form["model"],
             "--batch-size",
             form["batch_size"],
@@ -573,20 +546,19 @@ class MainWindow(QMainWindow):
         config_form.setSpacing(8)
 
         self.model_input = QLineEdit(DEFAULT_FORM_VALUES["model"])
-        config_form.addRow("Modelo Ollama", self.model_input)
+        config_form.addRow("Modelo", self.model_input)
 
         connection_row = QHBoxLayout()
-        self.ollama_mode_combo = QComboBox()
-        self.ollama_mode_combo.addItem("Local", "local")
-        self.ollama_mode_combo.addItem("IP/URL", "remote")
-        self.ollama_mode_combo.currentIndexChanged.connect(self._update_endpoint_visibility)
-        connection_row.addWidget(QLabel("Conexao Ollama"))
-        connection_row.addWidget(self.ollama_mode_combo, 1)
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("Ollama", "ollama")
+        self.backend_combo.addItem("llama-swap", "llama-swap")
+        connection_row.addWidget(QLabel("Backend"))
+        connection_row.addWidget(self.backend_combo, 1)
         config_form.addRow(connection_row)
 
-        self.ollama_endpoint_input = QLineEdit()
-        self.ollama_endpoint_input.setPlaceholderText("192.168.1.10:11434 ou https://ollama.seudns.com")
-        config_form.addRow("IP:Porta ou URL/DNS", self.ollama_endpoint_input)
+        self.api_base_input = QLineEdit()
+        self.api_base_input.setPlaceholderText("http://127.0.0.1:9292/v1")
+        config_form.addRow("API base", self.api_base_input)
 
         self.batch_input = QSpinBox()
         self.batch_input.setRange(1, 1000)
@@ -791,17 +763,9 @@ class MainWindow(QMainWindow):
         self.model_input.setText(defaults.get("model", DEFAULT_FORM_VALUES["model"]))
         self.batch_input.setValue(int(defaults.get("batch_size", DEFAULT_FORM_VALUES["batch_size"])))
         self.timeout_input.setValue(int(defaults.get("timeout", DEFAULT_FORM_VALUES["timeout"])))
-        mode = defaults.get("ollama_mode", "local")
-        idx = 0 if mode != "remote" else 1
-        self.ollama_mode_combo.setCurrentIndex(idx)
-        self.ollama_endpoint_input.setText(defaults.get("ollama_endpoint", ""))
-        self._update_endpoint_visibility()
-
-    def _update_endpoint_visibility(self) -> None:
-        is_remote = self.ollama_mode_combo.currentData() == "remote"
-        self.ollama_endpoint_input.setEnabled(is_remote)
-        if not is_remote:
-            self.ollama_endpoint_input.clear()
+        backend = defaults.get("backend", DEFAULT_BACKEND)
+        self.backend_combo.setCurrentIndex(0 if backend == "ollama" else 1)
+        self.api_base_input.setText(defaults.get("api_base", ""))
 
     def _append_log(self, line: str) -> None:
         line = _sanitize_logs(line)
@@ -832,8 +796,8 @@ class MainWindow(QMainWindow):
             "model": self.model_input.text().strip(),
             "batch_size": str(self.batch_input.value()),
             "timeout": str(self.timeout_input.value()),
-            "ollama_mode": self.ollama_mode_combo.currentData(),
-            "ollama_endpoint": self.ollama_endpoint_input.text().strip(),
+            "backend": self.backend_combo.currentData(),
+            "api_base": self.api_base_input.text().strip(),
         }
 
     def on_upload_clicked(self) -> None:
@@ -907,18 +871,19 @@ class MainWindow(QMainWindow):
             return
 
         ollama_host = (
-            normalized["ollama_endpoint"]
-            if normalized["ollama_mode"] == "remote"
+            normalized["api_base"]
+            if normalized["backend"] == "ollama" and normalized["api_base"]
             else None
         )
 
-        self._append_log("[GUI] Validando modelo no Ollama...")
-        QApplication.processEvents()
-        available, model_error = _ensure_ollama_model_available(normalized["model"], ollama_host)
-        if not available:
-            QMessageBox.critical(self, "Modelo indisponivel", model_error)
-            self._append_log(f"[GUI] {model_error}")
-            return
+        if normalized["backend"] == "ollama":
+            self._append_log("[GUI] Validando modelo no Ollama...")
+            QApplication.processEvents()
+            available, model_error = _ensure_ollama_model_available(normalized["model"], ollama_host)
+            if not available:
+                QMessageBox.critical(self, "Modelo indisponivel", model_error)
+                self._append_log(f"[GUI] {model_error}")
+                return
 
         full_form = {
             "input_dir": str(ENTRY_DIR),
@@ -926,8 +891,8 @@ class MainWindow(QMainWindow):
             "model": normalized["model"],
             "batch_size": normalized["batch_size"],
             "timeout": normalized["timeout"],
-            "ollama_mode": normalized["ollama_mode"],
-            "ollama_endpoint": normalized["ollama_endpoint"],
+            "backend": normalized["backend"],
+            "api_base": normalized["api_base"],
             "turbo": "on" if self.turbo_check.isChecked() else "off",
             "clear_cache": "on" if self.clear_cache_check.isChecked() else "off",
             "no_cache": "on" if self.no_cache_check.isChecked() else "off",
@@ -954,7 +919,7 @@ class MainWindow(QMainWindow):
             self._state["return_code"] = None
             self._state["logs"] = [
                 "[GUI] Iniciando processo...",
-                f"[GUI] Ollama: {normalized['ollama_endpoint'] if normalized['ollama_mode'] == 'remote' else 'local'}",
+                f"[GUI] Backend: {normalized['backend']} ({normalized['api_base'] or 'local'})",
                 f"[GUI] Comando: {_sanitize_logs(' '.join(cmd))}",
             ]
 
