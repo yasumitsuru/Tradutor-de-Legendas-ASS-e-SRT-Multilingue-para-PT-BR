@@ -13,6 +13,7 @@ from typing import Any, Callable, Sequence
 
 from tqdm import tqdm
 
+from inference_backend import BackendModelNotFoundError
 from run_manifest import initialize_run_manifest, record_run_output
 from subtitle_formats import (
     SUPPORTED_FORMATS,
@@ -49,7 +50,7 @@ _ensure_ollama_model_available = ensure_ollama_model_available
 def shutdown_ollama_model(model_name: str) -> None:
     """Backward-compatible wrapper for the Ollama adapter shutdown path."""
 
-    OllamaBackend().close(model_name)
+    OllamaBackend().close()
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -211,7 +212,15 @@ async def main(
 
     backend = OllamaBackend()
     try:
-        ensure_ollama_model_available(config["model"], client=backend.client)
+        try:
+            backend.ensure_available(config["model"])
+        except BackendModelNotFoundError as exc:
+            raise ModelUnavailableError(
+                f'❌ Modelo "{config["model"]}" não está disponível no Ollama. '
+                f"Instale antes com: ollama pull {config["model"]}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"❌ Não foi possível validar o modelo no Ollama: {exc}") from exc
     except (ModelUnavailableError, RuntimeError) as exc:
         print(str(exc))
         print("⛔ Encerrando backend para nova tentativa com um modelo válido.")

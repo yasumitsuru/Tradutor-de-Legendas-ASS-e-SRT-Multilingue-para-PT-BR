@@ -3,9 +3,23 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 import translate_ass_fast
 from run_manifest import load_run_outputs
 from translation_engine import IncompleteTranslationError
+
+
+@pytest.fixture(autouse=True)
+def available_ollama_backend(monkeypatch) -> None:
+    class AvailableOllamaBackend:
+        def ensure_available(self, _model: str) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "OllamaBackend", AvailableOllamaBackend)
 
 
 def test_cli_processes_both_formats_preserving_extension_and_reporting_counts(
@@ -335,3 +349,68 @@ def test_cli_failed_run_keeps_old_output_and_leaves_manifest_empty(
     assert old_output.read_text(encoding="utf-8") == "resultado antigo"
     assert load_run_outputs(manifest, output_dir) == []
     assert "Arquivos com falha: episode.ass" in output
+
+
+def test_cli_preflight_and_shutdown_use_the_same_selected_backend(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    output_dir = tmp_path / "saida"
+    input_dir.mkdir()
+    (input_dir / "episode.ass").write_text("fixture", encoding="utf-8")
+    created_backends: list[object] = []
+    translator_backends: list[object] = []
+
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.selected_model: str | None = None
+            self.closed = False
+            created_backends.append(self)
+
+        def ensure_available(self, model: str) -> None:
+            self.selected_model = model
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeTranslator:
+        def __init__(self, _config, *, backend) -> None:
+            translator_backends.append(backend)
+            self.cache = {}
+
+        async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
+            destination.write_text("translated", encoding="utf-8")
+            return {"total": 1, "translated": 1, "cached": 0, "skipped": 0, "failed": 0}
+
+        def _save_cache(self) -> None:
+            return None
+
+    monkeypatch.setattr(translate_ass_fast, "OllamaBackend", FakeBackend)
+    monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
+
+    result = asyncio.run(
+        translate_ass_fast.main(
+            ["--input-dir", str(input_dir), "--output-dir", str(output_dir), "--no-cache"]
+        )
+    )
+
+    backend = created_backends[0]
+    assert result == 0
+    assert created_backends == [backend]
+    assert translator_backends == [backend]
+    assert backend.selected_model == "qwen2.5:14b"
+    assert backend.closed is True
+
+
+def test_legacy_shutdown_does_not_pass_an_unselected_model_to_an_adapter(monkeypatch) -> None:
+    closed_backends: list[object] = []
+
+    class FakeBackend:
+        def close(self) -> None:
+            closed_backends.append(self)
+
+    monkeypatch.setattr(translate_ass_fast, "OllamaBackend", FakeBackend)
+
+    translate_ass_fast.shutdown_ollama_model("qwen2.5:14b")
+
+    assert len(closed_backends) == 1

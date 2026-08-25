@@ -69,9 +69,13 @@ class OllamaBackend:
         return GenerationResult(text=response_text.strip(), backend=self.backend_id, model=request.model)
 
     def close(self, model: str | None = None) -> None:
-        """Best-effort unload of the selected model; repeated calls are no-ops."""
+        """Best-effort unload of the selected model; repeated calls are no-ops.
 
-        model_name = model or self._selected_model
+        The optional model argument is retained for compatibility but never selects
+        a model for shutdown.
+        """
+
+        model_name = self._selected_model
         if self._closed or not model_name:
             return
         self._closed = True

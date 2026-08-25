@@ -104,6 +104,14 @@ def test_close_unloads_the_selected_model_only_once() -> None:
     ]
 
 
+def test_close_does_not_unload_an_explicit_model_without_selection() -> None:
+    client = FakeOllamaClient()
+
+    OllamaBackend(client=client).close("qwen2.5:14b")
+
+    assert client.unload_calls == []
+
+
 def test_legacy_validation_aliases_use_the_adapter_classification() -> None:
     class MissingModelError(RuntimeError):
         status_code = 404
