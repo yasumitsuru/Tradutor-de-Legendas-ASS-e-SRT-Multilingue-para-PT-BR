@@ -5,15 +5,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import shutil
-import subprocess
 import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-import ollama
 from tqdm import tqdm
 
 from run_manifest import initialize_run_manifest, record_run_output
@@ -31,6 +28,7 @@ from translation_engine import (
     ensure_ollama_model_available,
     is_model_not_found_error,
 )
+from ollama_backend import OllamaBackend
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -49,56 +47,9 @@ _ensure_ollama_model_available = ensure_ollama_model_available
 
 
 def shutdown_ollama_model(model_name: str) -> None:
-    """Best-effort model unload after a local or remote translation run."""
+    """Backward-compatible wrapper for the Ollama adapter shutdown path."""
 
-    if not model_name:
-        return
-    print(f"\n🛑 Encerrando modelo Ollama: {model_name}")
-    try:
-        running = ollama.ps()
-        loaded_models: list[str] = []
-        for model_info in getattr(running, "models", []):
-            model = getattr(model_info, "model", None)
-            name = getattr(model_info, "name", None)
-            if model:
-                loaded_models.append(model)
-            if name:
-                loaded_models.append(name)
-        if model_name not in loaded_models:
-            print(f"ℹ️ Modelo '{model_name}' já não está carregado.")
-            return
-    except Exception as exc:
-        print(f"⚠️ Não foi possível consultar modelos ativos ({exc}). Tentando encerrar mesmo assim...")
-
-    try:
-        ollama.generate(model=model_name, prompt="", keep_alive=0)
-        print(f"✅ Modelo '{model_name}' descarregado via API.")
-        return
-    except Exception as exc:
-        print(f"⚠️ Falha ao descarregar via API: {exc}")
-
-    ollama_cli = shutil.which("ollama")
-    if not ollama_cli:
-        print("⚠️ Comando 'ollama' não encontrado para fallback de encerramento.")
-        return
-    try:
-        result = subprocess.run(
-            [ollama_cli, "stop", model_name],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"⚠️ Erro ao tentar encerrar via CLI: {exc}")
-        return
-    details = (result.stdout or result.stderr).strip()
-    if result.returncode == 0:
-        print(f"✅ Modelo '{model_name}' encerrado via CLI.")
-    else:
-        print(f"⚠️ Não foi possível encerrar o modelo via CLI (código {result.returncode}).")
-    if details:
-        print(f"   ↳ {details}")
+    OllamaBackend().close(model_name)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -258,14 +209,15 @@ async def main(
     else:
         print(f"🌐 Idioma de origem informado: {config['source_language']}")
 
+    backend = OllamaBackend()
     try:
-        ensure_ollama_model_available(config["model"])
+        ensure_ollama_model_available(config["model"], client=backend.client)
     except (ModelUnavailableError, RuntimeError) as exc:
         print(str(exc))
         print("⛔ Encerrando backend para nova tentativa com um modelo válido.")
         return 2
 
-    translator = FixedASSTranslator(config)
+    translator = FixedASSTranslator(config, backend=backend)
     season_started_at = datetime.now()
     summary = _new_format_summary()
     failed_files: list[str] = []
@@ -312,7 +264,7 @@ async def main(
         print(f"{'=' * 60}")
         return 1 if failed_files else 0
     finally:
-        shutdown_ollama_model(config["model"])
+        backend.close()
 
 
 if __name__ == "__main__":

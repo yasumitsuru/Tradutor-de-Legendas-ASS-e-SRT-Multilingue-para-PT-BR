@@ -12,9 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
-import ollama
 import pysubs2
 
+from inference_backend import BackendModelNotFoundError, GenerationRequest, InferenceBackend
+from ollama_backend import OllamaBackend, is_model_not_found_error as _is_model_not_found_error
 from subtitle_formats import (
     ASSFormatHandler,
     PreparedSubtitleText,
@@ -104,24 +105,22 @@ class IncompleteTranslationError(SubtitleValidationError):
 
 
 def is_model_not_found_error(exc: Exception) -> bool:
-    """Detect Ollama errors that represent a missing model."""
+    """Backward-compatible alias for Ollama missing-model classification."""
 
-    status_code = getattr(exc, "status_code", None)
-    message = str(exc).lower()
-    return status_code == 404 or ("model" in message and "not found" in message)
+    return _is_model_not_found_error(exc)
 
 
-def ensure_ollama_model_available(model_name: str, client: Any = ollama) -> None:
+def ensure_ollama_model_available(model_name: str, client: Any | None = None) -> None:
     """Validate the model before processing any user file."""
 
     try:
-        client.show(model_name)
+        OllamaBackend(client=client).ensure_available(model_name)
+    except BackendModelNotFoundError as exc:
+        raise ModelUnavailableError(
+            f'❌ Modelo "{model_name}" não está disponível no Ollama. '
+            f"Instale antes com: ollama pull {model_name}"
+        ) from exc
     except Exception as exc:
-        if is_model_not_found_error(exc):
-            raise ModelUnavailableError(
-                f'❌ Modelo "{model_name}" não está disponível no Ollama. '
-                f"Instale antes com: ollama pull {model_name}"
-            ) from exc
         raise RuntimeError(f"❌ Não foi possível validar o modelo no Ollama: {exc}") from exc
 
 
@@ -138,7 +137,12 @@ class TranslationOutcome:
 class FixedASSTranslator:
     """Backward-compatible name for the shared ASS/SRT translator."""
 
-    def __init__(self, config: Mapping[str, Any], ollama_client: Any | None = None):
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        ollama_client: Any | None = None,
+        backend: InferenceBackend | None = None,
+    ):
         self.config = {**CONFIG, **dict(config)}
         trace_hook = self.config.pop("trace_hook", None)
         self._trace_hook = trace_hook if callable(trace_hook) else None
@@ -147,7 +151,8 @@ class FixedASSTranslator:
         self.config["source_language"] = (
             "auto" if not source_language or source_language.casefold() == "auto" else source_language
         )
-        self.ollama_client = ollama_client or ollama
+        self.backend = backend or OllamaBackend(client=ollama_client)
+        self.ollama_client = getattr(self.backend, "client", ollama_client)
         self.stats: dict[str, int] = {}
         self.reset_stats()
         self.cache: dict[str, str] = {}
@@ -508,27 +513,22 @@ class FixedASSTranslator:
             if temperature is None
             else float(temperature)
         )
-        response = await asyncio.wait_for(
+        result = await asyncio.wait_for(
             asyncio.to_thread(
-                self.ollama_client.generate,
-                model=self.config["model"],
-                prompt=prompt,
-                system=self.config["system_prompt"],
-                options={
-                    "temperature": effective_temperature,
-                    "num_predict": self.config["max_tokens"],
-                    "top_p": 0.9,
-                },
+                self.backend.generate,
+                GenerationRequest(
+                    model=self.config["model"],
+                    system_prompt=self.config["system_prompt"],
+                    prompt=prompt,
+                    temperature=effective_temperature,
+                    top_p=0.9,
+                    max_tokens=self.config["max_tokens"],
+                    timeout=self.config["timeout"],
+                ),
             ),
             timeout=self.config["timeout"],
         )
-        if isinstance(response, Mapping):
-            response_text = response.get("response")
-        else:
-            response_text = getattr(response, "response", None)
-        if not isinstance(response_text, str):
-            raise ValueError("Ollama retornou uma resposta sem campo textual válido.")
-        return response_text.strip()
+        return result.text
 
     @staticmethod
     def _parse_item_response(response_text: str) -> tuple[dict[int, str], str | None]:

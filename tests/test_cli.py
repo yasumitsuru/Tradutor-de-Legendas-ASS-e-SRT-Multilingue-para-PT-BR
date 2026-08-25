@@ -20,7 +20,7 @@ def test_cli_processes_both_formats_preserving_extension_and_reporting_counts(
     destinations: list[Path] = []
 
     class FakeTranslator:
-        def __init__(self, _config) -> None:
+        def __init__(self, _config, **_kwargs) -> None:
             self.cache = {}
 
         async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
@@ -32,7 +32,7 @@ def test_cli_processes_both_formats_preserving_extension_and_reporting_counts(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(
@@ -66,7 +66,7 @@ def test_cli_format_filter_reports_other_supported_file_as_ignored(
     (input_dir / "skip.srt").write_text("fixture", encoding="utf-8")
 
     class FakeTranslator:
-        def __init__(self, _config) -> None:
+        def __init__(self, _config, **_kwargs) -> None:
             self.cache = {}
 
         async def translate_file(self, _source: Path, destination: Path) -> dict[str, int]:
@@ -77,7 +77,7 @@ def test_cli_format_filter_reports_other_supported_file_as_ignored(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(
@@ -115,7 +115,7 @@ def test_cli_original_fallback_defaults_false_and_is_propagated_when_enabled(
     received_configs: list[dict] = []
 
     class FakeTranslator:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **_kwargs) -> None:
             received_configs.append(config)
             self.cache = {}
 
@@ -127,7 +127,7 @@ def test_cli_original_fallback_defaults_false_and_is_propagated_when_enabled(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(
@@ -162,7 +162,7 @@ def test_cli_source_language_defaults_to_auto_and_propagates_any_manual_value(
     received_configs: list[dict] = []
 
     class FakeTranslator:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **_kwargs) -> None:
             received_configs.append(config)
             self.cache = {}
 
@@ -174,7 +174,7 @@ def test_cli_source_language_defaults_to_auto_and_propagates_any_manual_value(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(
@@ -207,7 +207,7 @@ def test_cli_passes_optional_trace_hook_without_exposing_a_public_flag(
     received_configs: list[dict] = []
 
     class FakeTranslator:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **_kwargs) -> None:
             received_configs.append(config)
             self.cache = {}
 
@@ -219,7 +219,7 @@ def test_cli_passes_optional_trace_hook_without_exposing_a_public_flag(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(
@@ -252,7 +252,7 @@ def test_cli_uses_an_internal_isolated_cache_path_when_provided(
     received_configs: list[dict] = []
 
     class FakeTranslator:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **_kwargs) -> None:
             received_configs.append(config)
             self.cache = {}
 
@@ -264,7 +264,7 @@ def test_cli_uses_an_internal_isolated_cache_path_when_provided(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FakeTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(
@@ -303,7 +303,7 @@ def test_cli_failed_run_keeps_old_output_and_leaves_manifest_empty(
     manifest = tmp_path / "run.json"
 
     class FailingTranslator:
-        def __init__(self, _config) -> None:
+        def __init__(self, _config, **_kwargs) -> None:
             self.cache = {}
 
         async def translate_file(self, _source: Path, _destination: Path) -> dict[str, int]:
@@ -313,7 +313,7 @@ def test_cli_failed_run_keeps_old_output_and_leaves_manifest_empty(
             return None
 
     monkeypatch.setattr(translate_ass_fast, "FixedASSTranslator", FailingTranslator)
-    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda _model: None)
+    monkeypatch.setattr(translate_ass_fast, "ensure_ollama_model_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translate_ass_fast, "shutdown_ollama_model", lambda _model: None)
 
     result = asyncio.run(

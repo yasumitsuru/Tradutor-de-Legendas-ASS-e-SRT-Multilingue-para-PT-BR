@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from subtitle_formats import ASSFormatHandler, SRTFormatHandler
+from inference_backend import GenerationResult
 from translation_engine import (
     CACHE_SCHEMA_VERSION,
     CONFIG,
@@ -61,6 +62,33 @@ def translator_config(tmp_path: Path, **overrides) -> dict:
         "batch_size": 10,
         **overrides,
     }
+
+
+def test_translator_uses_an_injected_backend_for_generation(tmp_path: Path) -> None:
+    class FakeBackend:
+        backend_id = "fake"
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        def generate(self, request) -> GenerationResult:
+            self.requests.append(request)
+            return GenerationResult(text="resultado", backend="fake", model=request.model)
+
+        def ensure_available(self, _model: str) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    backend = FakeBackend()
+    translator = FixedASSTranslator(translator_config(tmp_path), backend=backend)
+
+    response = asyncio.run(translator._generate("prompt", temperature=0.0))
+
+    assert response == "resultado"
+    assert backend.requests[0].prompt == "prompt"
+    assert backend.requests[0].temperature == 0.0
 
 
 def test_default_language_configuration_and_system_prompt_are_multilingual() -> None:
