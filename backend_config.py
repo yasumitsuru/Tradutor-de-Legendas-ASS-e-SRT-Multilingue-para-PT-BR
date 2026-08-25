@@ -97,9 +97,17 @@ def _migrate_settings(raw: dict[str, object]) -> BackendSettings:
     model = str(raw.get("model") or DEFAULT_MODEL)
     api_base = raw.get("api_base")
     if "backend" not in raw:
-        mode = str(raw.get("ollama_mode") or "local").strip().lower()
+        legacy_mode = raw.get("ollama_mode", "local")
+        mode = legacy_mode.strip().lower() if isinstance(legacy_mode, str) else ""
+        if mode not in {"local", "remote"}:
+            raise BackendConfigurationError("O modo Ollama legado deve ser 'local' ou 'remote'.")
         backend = "ollama"
-        api_base = raw.get("ollama_endpoint") if mode == "remote" else None
+        if mode == "remote":
+            api_base = raw.get("ollama_endpoint")
+            if not isinstance(api_base, str) or not api_base.strip():
+                raise BackendConfigurationError("O endpoint do Ollama remoto legado é obrigatório.")
+        else:
+            api_base = None
     endpoint = normalize_backend_endpoint(backend, str(api_base) if api_base is not None else None)
     return BackendSettings(
         backend=backend,

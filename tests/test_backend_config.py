@@ -82,6 +82,29 @@ def test_load_backend_settings_migrates_legacy_local_and_remote_ollama_values(tm
     assert (remote.backend, remote.api_base) == ("ollama", "https://ollama.example.test:11434")
 
 
+def test_load_backend_settings_rejects_an_unknown_legacy_ollama_mode(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"ollama_mode": "hosted", "ollama_endpoint": "https://ollama.example.test:11434"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BackendConfigurationError):
+        load_backend_settings(path)
+
+
+@pytest.mark.parametrize("endpoint", (None, ""))
+def test_load_backend_settings_rejects_legacy_remote_ollama_without_endpoint(tmp_path, endpoint: str | None) -> None:
+    path = tmp_path / "settings.json"
+    legacy_settings: dict[str, str] = {"ollama_mode": "remote"}
+    if endpoint is not None:
+        legacy_settings["ollama_endpoint"] = endpoint
+    path.write_text(json.dumps(legacy_settings), encoding="utf-8")
+
+    with pytest.raises(BackendConfigurationError):
+        load_backend_settings(path)
+
+
 def test_save_backend_settings_keeps_canonical_and_legacy_ollama_keys(tmp_path) -> None:
     path = tmp_path / "settings.json"
     settings = BackendSettings(backend="ollama", api_base="https://ollama.example.test:11434", model="qwen2.5:14b")
