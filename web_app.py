@@ -28,7 +28,6 @@ from backend_config import (
     normalize_backend_endpoint,
     save_backend_settings,
 )
-from backend_factory import create_backend
 from flask import (
     Flask,
     Response,
@@ -825,13 +824,6 @@ def start_translation():
         ), 400
 
     settings = _settings_from_form(normalized_settings)
-    backend = create_backend(settings)
-    try:
-        backend.ensure_available(settings.model)
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"Não foi possível validar o modelo no backend {settings.backend}: {exc}"}), 400
-    finally:
-        backend.close()
 
     form = {
         "input_dir": str(safe_input),

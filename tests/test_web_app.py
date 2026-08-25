@@ -98,13 +98,15 @@ def test_upload_rejects_request_without_supported_subtitles(web_client) -> None:
     assert "ASS ou SRT" in response.get_json()["error"]
 
 
-def test_start_rejects_empty_input_before_contacting_ollama(
+def test_start_rejects_empty_input_before_preflighting_a_backend(
     web_client, monkeypatch
 ) -> None:
-    def unexpected_model_check(*_args, **_kwargs):
-        raise AssertionError("Ollama must not be contacted without subtitle files")
+    def unexpected_backend_factory(*_args, **_kwargs):
+        raise AssertionError("No backend must be preflighted without subtitle files")
 
-    monkeypatch.setattr(web_app, "_ensure_ollama_model_available", unexpected_model_check)
+    monkeypatch.setattr(
+        web_app, "create_backend", unexpected_backend_factory, raising=False
+    )
     response = web_client.post(
         "/start",
         data={
@@ -121,6 +123,49 @@ def test_start_rejects_empty_input_before_contacting_ollama(
 
     assert response.status_code == 400
     assert "ASS ou SRT" in response.get_json()["error"]
+
+
+def test_start_does_not_preflight_or_close_backend_before_launching_worker(
+    web_client, tmp_path: Path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "entrada"
+    input_dir.mkdir()
+    (input_dir / "episode.srt").write_text("subtitle", encoding="utf-8")
+
+    def unexpected_backend_factory(*_args, **_kwargs):
+        raise AssertionError("The worker, not /start, owns backend lifecycle")
+
+    started_threads = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs) -> None:
+            started_threads.append((args, kwargs))
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        web_app, "create_backend", unexpected_backend_factory, raising=False
+    )
+    monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
+
+    response = web_client.post(
+        "/start",
+        data={
+            "csrf_token": "csrf-for-tests",
+            "input_dir": "./entrada",
+            "output_dir": "./saida",
+            "backend": "ollama",
+            "api_base": "",
+            "model": "qwen2.5:14b",
+            "batch_size": "10",
+            "timeout": "60",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["ok"] is True
+    assert len(started_threads) == 1
 
 
 @pytest.mark.parametrize(
@@ -148,6 +193,8 @@ def test_web_page_exposes_backend_api_base_and_model_controls(web_client) -> Non
     assert 'name="api_base"' in html
     assert 'name="model"' in html
     assert "llama-swap" in html
+    assert "API base / endpoint Ollama" not in html
+    assert "API base" in html
 
 
 def test_save_config_selects_llama_swap_and_persists_canonical_values(web_client) -> None:
