@@ -322,7 +322,7 @@ async def run_experiment(args: argparse.Namespace) -> int:
         "--backend",
         settings.backend,
         "--api-base",
-        str(args.api_base),
+        str(settings.api_base),
         "--source-language",
         str(args.source_language),
         "--batch-size",

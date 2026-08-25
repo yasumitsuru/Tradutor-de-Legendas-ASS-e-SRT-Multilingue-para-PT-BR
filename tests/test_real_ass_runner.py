@@ -341,7 +341,7 @@ def test_runner_uses_selected_llama_swap_for_preflight_and_delegates_endpoint(
                 "--backend",
                 "llama-swap",
                 "--api-base",
-                "http://127.0.0.1:9292/v1",
+                "  http://127.0.0.1:9292/  ",
                 "--model",
                 "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
             )
