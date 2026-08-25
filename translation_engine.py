@@ -27,7 +27,7 @@ from subtitle_formats import (
 )
 
 
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 PROMPT_VERSION = "subtitle-items-v4-multilingual-auto-item-envelope"
 ITEM_BLOCK_RE = re.compile(
     r"<<<ITEM_(\d{4})>>>[ \t]*\r?\n?(.*?)[ \t]*\r?\n?<<<END_ITEM_\1>>>",
@@ -246,8 +246,23 @@ class FixedASSTranslator:
 
         if isinstance(prepared, str):
             prepared = ASSFormatHandler().prepare_text(prepared)
+        generation_profile = {
+            "system_prompt": self.config["system_prompt"],
+            "prompt_version": self.config["prompt_version"],
+            "temperature": self.config["temperature"],
+            "top_p": 0.9,
+            "max_tokens": self.config["max_tokens"],
+            "timeout": self.config["timeout"],
+        }
+        generation_profile_json = json.dumps(
+            generation_profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         payload = {
             "cache_schema_version": CACHE_SCHEMA_VERSION,
+            "backend": str(getattr(self.backend, "backend_id", type(self.backend).__qualname__)),
+            "generation_profile": hashlib.sha256(
+                generation_profile_json.encode("utf-8")
+            ).hexdigest(),
             "format": prepared.format_name,
             "cleaned_text": prepared.cleaned_text,
             "line_structure": prepared.line_structure,

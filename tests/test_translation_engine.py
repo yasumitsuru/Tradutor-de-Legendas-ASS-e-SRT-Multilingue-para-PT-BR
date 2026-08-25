@@ -87,8 +87,44 @@ def test_translator_uses_an_injected_backend_for_generation(tmp_path: Path) -> N
     response = asyncio.run(translator._generate("prompt", temperature=0.0))
 
     assert response == "resultado"
-    assert backend.requests[0].prompt == "prompt"
-    assert backend.requests[0].temperature == 0.0
+    assert len(backend.requests) == 1
+    request = backend.requests[0]
+    assert request.model == translator.config["model"]
+    assert request.system_prompt == translator.config["system_prompt"]
+    assert request.prompt == "prompt"
+    assert request.temperature == 0.0
+    assert request.top_p == 0.9
+    assert request.max_tokens == translator.config["max_tokens"]
+    assert request.timeout == translator.config["timeout"]
+
+
+def test_backend_result_metadata_never_reaches_item_validation(tmp_path: Path) -> None:
+    class MetadataBackend:
+        backend_id = "llama-swap"
+
+        def generate(self, request) -> GenerationResult:
+            return GenerationResult(
+                text="<<<ITEM_0001>>>\nTraduzido\n<<<END_ITEM_0001>>>",
+                backend=self.backend_id,
+                model=request.model,
+                metadata={"response": "metadata must not be parsed"},
+            )
+
+        def ensure_available(self, _model: str) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    handler = SRTFormatHandler()
+    translator = FixedASSTranslator(translator_config(tmp_path), backend=MetadataBackend())
+
+    outcomes = asyncio.run(
+        translator.translate_single_batch([handler.prepare_text("Original")], handler, 1, 1)
+    )
+
+    assert [outcome.text for outcome in outcomes] == ["Traduzido"]
+    assert outcomes[0].used_fallback is False
 
 
 def test_default_language_configuration_and_system_prompt_are_multilingual() -> None:
@@ -284,7 +320,8 @@ def test_cache_uses_versioned_schema(tmp_path: Path) -> None:
 
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
 
-    assert payload["schema_version"] == CACHE_SCHEMA_VERSION
+    assert CACHE_SCHEMA_VERSION == 5
+    assert payload["schema_version"] == 5
     assert payload["prompt_version"] == CONFIG["prompt_version"]
     assert payload["entries"] == {"key": "value"}
 
@@ -315,6 +352,37 @@ def test_cache_key_distinguishes_auto_from_explicit_source_language(tmp_path: Pa
     manual = FixedASSTranslator(translator_config(tmp_path, source_language="English"))
 
     assert automatic._get_text_hash(prepared) != manual._get_text_hash(prepared)
+
+
+def test_cache_key_isolated_by_backend_and_generation_profile(tmp_path: Path) -> None:
+    class OllamaBackend:
+        backend_id = "ollama"
+
+        def generate(self, _request) -> GenerationResult:
+            raise AssertionError("cache key generation must not call a backend")
+
+        def ensure_available(self, _model: str) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class LlamaSwapBackend(OllamaBackend):
+        backend_id = "llama-swap"
+
+    prepared = SRTFormatHandler().prepare_text("Same subtitle")
+    ollama = FixedASSTranslator(
+        translator_config(tmp_path), backend=OllamaBackend()
+    )
+    llama_swap = FixedASSTranslator(
+        translator_config(tmp_path), backend=LlamaSwapBackend()
+    )
+    changed_profile = FixedASSTranslator(
+        translator_config(tmp_path, temperature=0.3), backend=OllamaBackend()
+    )
+
+    assert ollama._get_text_hash(prepared) != llama_swap._get_text_hash(prepared)
+    assert ollama._get_text_hash(prepared) != changed_profile._get_text_hash(prepared)
 
 
 def test_legacy_ass_escape_helpers_remain_compatible(tmp_path: Path) -> None:
