@@ -11,6 +11,9 @@
     <section class="panel">
       <h1>Tradutor de Legendas ASS e SRT Multilíngue para PT-BR by Yasu</h1>
       <p>Detecção automática de um ou mais idiomas por item, usando o modelo Ollama.</p>
+      {% if config_error %}
+      <p class="meta" role="alert">{{ config_error }}</p>
+      {% endif %}
 
       <form id="translation-form" class="form-grid">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -34,27 +37,27 @@
         <input type="hidden" name="output_dir" value="{{ defaults.output_dir }}">
 
         <label>
-          Modelo Ollama
+          Backend
+          <select id="backend" name="backend">
+            <option value="ollama" {% if defaults.backend == "ollama" %}selected{% endif %}>Ollama</option>
+            <option value="llama-swap" {% if defaults.backend == "llama-swap" %}selected{% endif %}>llama-swap</option>
+          </select>
+        </label>
+
+        <label>
+          Modelo
           <input type="text" name="model" value="{{ defaults.model }}" required>
         </label>
 
         <div class="compact-row">
-          <label>
-            Conexão Ollama
-            <select id="ollama-mode" name="ollama_mode">
-              <option value="local" {% if defaults.ollama_mode != "remote" %}selected{% endif %}>Local</option>
-              <option value="remote" {% if defaults.ollama_mode == "remote" %}selected{% endif %}>IP/URL</option>
-            </select>
-          </label>
-
-          <label id="ollama-endpoint-wrap">
-            IP:Porta ou URL/DNS
+          <label id="api-base-wrap">
+            API base / endpoint Ollama
             <input
               type="text"
-              id="ollama-endpoint"
-              name="ollama_endpoint"
-              value="{{ defaults.ollama_endpoint }}"
-              placeholder="192.168.1.10:11434 ou https://ollama.seudns.com"
+              id="api-base"
+              name="api_base"
+              value="{{ defaults.api_base }}"
+              placeholder="http://127.0.0.1:9292/v1"
             >
           </label>
         </div>
@@ -141,9 +144,9 @@
     const csrfTokenField = document.querySelector('input[name="csrf_token"]');
     const csrfToken = csrfTokenField ? csrfTokenField.value : '';
     const modelInput = form.querySelector('input[name="model"]');
-    const ollamaModeInput = form.querySelector('select[name="ollama_mode"]');
-    const ollamaEndpointWrap = document.getElementById('ollama-endpoint-wrap');
-    const ollamaEndpointInput = form.querySelector('input[name="ollama_endpoint"]');
+    const backendInput = form.querySelector('select[name="backend"]');
+    const apiBaseWrap = document.getElementById('api-base-wrap');
+    const apiBaseInput = form.querySelector('input[name="api_base"]');
     const batchSizeInput = form.querySelector('input[name="batch_size"]');
     const timeoutInput = form.querySelector('input[name="timeout"]');
     const saveConfigBtn = document.getElementById('save-config-btn');
@@ -184,12 +187,15 @@
       }
     }
 
-    function updateOllamaEndpointVisibility() {
-      if (!ollamaModeInput || !ollamaEndpointWrap) return;
-      const isRemote = ollamaModeInput.value === 'remote';
-      ollamaEndpointWrap.style.display = isRemote ? 'grid' : 'none';
-      if (ollamaEndpointInput) {
-        ollamaEndpointInput.required = isRemote;
+    function updateBackendEndpointVisibility() {
+      if (!backendInput || !apiBaseWrap) return;
+      const isLlamaSwap = backendInput.value === 'llama-swap';
+      apiBaseWrap.style.display = 'grid';
+      if (apiBaseInput) {
+        apiBaseInput.required = isLlamaSwap;
+        apiBaseInput.placeholder = isLlamaSwap
+          ? 'http://127.0.0.1:9292/v1'
+          : 'Opcional: http://192.168.1.10:11434';
       }
     }
 
@@ -288,11 +294,11 @@
     function applyConfig(config) {
       if (!config) return;
       if (typeof config.model === 'string') modelInput.value = config.model;
-      if (typeof config.ollama_mode === 'string') ollamaModeInput.value = config.ollama_mode;
-      if (typeof config.ollama_endpoint === 'string') ollamaEndpointInput.value = config.ollama_endpoint;
+      if (typeof config.backend === 'string') backendInput.value = config.backend;
+      if (typeof config.api_base === 'string') apiBaseInput.value = config.api_base;
       if (typeof config.batch_size === 'string') batchSizeInput.value = config.batch_size;
       if (typeof config.timeout === 'string') timeoutInput.value = config.timeout;
-      updateOllamaEndpointVisibility();
+      updateBackendEndpointVisibility();
     }
 
     function renderFileList(target, items, emptyMessage) {
@@ -445,8 +451,8 @@
       const payload = new FormData();
       payload.append('csrf_token', csrfToken);
       payload.append('model', modelInput.value);
-      payload.append('ollama_mode', ollamaModeInput.value);
-      payload.append('ollama_endpoint', ollamaEndpointInput.value);
+      payload.append('backend', backendInput.value);
+      payload.append('api_base', apiBaseInput.value);
       payload.append('batch_size', batchSizeInput.value);
       payload.append('timeout', timeoutInput.value);
 
@@ -497,9 +503,9 @@
     });
 
     applyResponsiveMode();
-    updateOllamaEndpointVisibility();
-    if (ollamaModeInput) {
-      ollamaModeInput.addEventListener('change', updateOllamaEndpointVisibility);
+    updateBackendEndpointVisibility();
+    if (backendInput) {
+      backendInput.addEventListener('change', updateBackendEndpointVisibility);
     }
     window.addEventListener('resize', applyResponsiveMode);
     if (window.visualViewport) {

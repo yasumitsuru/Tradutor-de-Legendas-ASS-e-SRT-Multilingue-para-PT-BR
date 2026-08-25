@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 from pathlib import Path
 
@@ -120,6 +121,125 @@ def test_start_rejects_empty_input_before_contacting_ollama(
 
     assert response.status_code == 400
     assert "ASS ou SRT" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected_api_base"),
+    (
+        ({"ollama_mode": "local", "ollama_endpoint": ""}, ""),
+        ({"ollama_mode": "remote", "ollama_endpoint": "https://ollama.example.test:11434/"}, "https://ollama.example.test:11434"),
+    ),
+)
+def test_web_loads_legacy_ollama_config_through_shared_normalizer(
+    web_client, legacy: dict[str, str], expected_api_base: str
+) -> None:
+    web_app.WEB_CONFIG_PATH.write_text(json.dumps(legacy), encoding="utf-8")
+
+    defaults = web_app._effective_defaults()
+
+    assert defaults["backend"] == "ollama"
+    assert defaults["api_base"] == expected_api_base
+
+
+def test_web_page_exposes_backend_api_base_and_model_controls(web_client) -> None:
+    html = web_client.get("/").get_data(as_text=True)
+
+    assert 'name="backend"' in html
+    assert 'name="api_base"' in html
+    assert 'name="model"' in html
+    assert "llama-swap" in html
+
+
+def test_save_config_selects_llama_swap_and_persists_canonical_values(web_client) -> None:
+    response = web_client.post(
+        "/config/save",
+        data={
+            "csrf_token": "csrf-for-tests",
+            "backend": "llama-swap",
+            "api_base": "http://127.0.0.1:9292",
+            "model": "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+            "batch_size": "10",
+            "timeout": "60",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["config"] == {
+        "backend": "llama-swap",
+        "api_base": "http://127.0.0.1:9292/v1",
+        "model": "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+        "batch_size": "10",
+        "timeout": "60",
+    }
+    persisted = json.loads(web_app.WEB_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert persisted["backend"] == "llama-swap"
+    assert persisted["api_base"] == "http://127.0.0.1:9292/v1"
+    assert persisted["ollama_mode"] == "local"
+
+
+def test_save_config_returns_invalid_url_error_to_the_user(web_client) -> None:
+    response = web_client.post(
+        "/config/save",
+        data={
+            "csrf_token": "csrf-for-tests",
+            "backend": "llama-swap",
+            "api_base": "http://user:secret@127.0.0.1:9292/v1",
+            "model": "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+            "batch_size": "10",
+            "timeout": "60",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "credenciais" in response.get_json()["error"]
+
+
+def test_web_builds_backend_specific_command_and_subprocess_environment(monkeypatch) -> None:
+    llama_form = {
+        "input_dir": "entrada",
+        "output_dir": "saida",
+        "backend": "llama-swap",
+        "api_base": "http://127.0.0.1:9292/v1",
+        "model": "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+        "batch_size": "10",
+        "timeout": "60",
+    }
+    ollama_form = {**llama_form, "backend": "ollama", "api_base": "http://ollama.example.test:11434", "model": "qwen2.5:14b"}
+
+    assert web_app._build_command(llama_form) == [
+        web_app.sys.executable,
+        "-u",
+        str(web_app.SCRIPT_PATH),
+        "--input-dir", "entrada",
+        "--output-dir", "saida",
+        "-m", "Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+        "--backend", "llama-swap",
+        "--api-base", "http://127.0.0.1:9292/v1",
+        "--batch-size", "10",
+        "--timeout", "60",
+        "--result-manifest", str(web_app._run_manifest_path()),
+    ]
+    assert "--api-base" in web_app._build_command(ollama_form)
+
+    captured_envs: list[dict[str, str]] = []
+
+    class FakeProcess:
+        stdout = None
+
+        def wait(self) -> int:
+            return 0
+
+    def fake_popen(*_args, **kwargs):
+        captured_envs.append(kwargs["env"])
+        return FakeProcess()
+
+    monkeypatch.setattr(web_app.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("OLLAMA_HOST", "http://leaked.example.test:11434")
+    web_app._run_translation(["llama"], "llama-swap", "http://127.0.0.1:9292/v1")
+    web_app._run_translation(["ollama"], "ollama", "http://ollama.example.test:11434")
+
+    assert "OLLAMA_HOST" not in captured_envs[0]
+    assert captured_envs[1]["OLLAMA_HOST"] == "http://ollama.example.test:11434"
 
 
 def test_web_progress_understands_generic_subtitle_logs() -> None:

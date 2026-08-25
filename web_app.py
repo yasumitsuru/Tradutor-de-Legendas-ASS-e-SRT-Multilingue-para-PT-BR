@@ -14,14 +14,21 @@ import hashlib
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-import json
 import time
 from typing import Any
-from urllib import parse as urlparse
 from urllib import request as urlrequest
 from urllib import error as urlerror
 
 import ollama
+from backend_config import (
+    DEFAULT_BACKEND,
+    DEFAULT_MODEL,
+    BackendSettings,
+    load_backend_settings,
+    normalize_backend_endpoint,
+    save_backend_settings,
+)
+from backend_factory import create_backend
 from flask import (
     Flask,
     Response,
@@ -32,6 +39,7 @@ from flask import (
     session,
     stream_with_context,
 )
+from inference_backend import BackendConfigurationError
 
 from run_manifest import initialize_run_manifest, load_run_outputs
 from subtitle_formats import count_subtitle_formats, is_supported_subtitle, iter_subtitle_files
@@ -61,13 +69,12 @@ DEFAULT_REMOTE_OLLAMA_ENDPOINT = (os.environ.get("OLLAMA_ENDPOINT") or "").strip
 DEFAULT_FORM_VALUES: dict[str, str] = {
     "input_dir": "./entrada",
     "output_dir": "./saida",
-    "model": "qwen2.5:14b",
+    "backend": DEFAULT_BACKEND,
+    "api_base": DEFAULT_REMOTE_OLLAMA_ENDPOINT if IS_VERCEL else "",
+    "model": DEFAULT_MODEL,
     "batch_size": "15",
     "timeout": "300",
-    "ollama_mode": "remote" if IS_VERCEL else "local",
-    "ollama_endpoint": DEFAULT_REMOTE_OLLAMA_ENDPOINT,
 }
-CONFIG_KEYS = ("model", "batch_size", "timeout", "ollama_mode", "ollama_endpoint")
 
 if IS_VERCEL:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -116,56 +123,13 @@ def _validate_model(name: str) -> bool:
     return bool(name) and bool(_ALLOWED_MODEL_RE.match(name))
 
 
-def _normalize_ollama_connection(
-    mode_raw: str,
-    endpoint_raw: str,
-) -> tuple[bool, str, str, str | None, str]:
-    """Normaliza e valida modo/endpoint de conexão com Ollama (local ou remoto)."""
-    mode = (mode_raw or "local").strip().lower()
-    if mode not in {"local", "remote"}:
-        return False, "", "", None, "Tipo de conexão Ollama inválido."
-
-    endpoint = (endpoint_raw or "").strip()
-    if mode == "local":
-        return True, "local", "", None, ""
-
-    if not endpoint:
-        return (
-            False,
-            "",
-            "",
-            None,
-            "Informe IP:porta ou URL/DNS para o Ollama remoto.",
-        )
-
-    candidate = endpoint
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", candidate):
-        candidate = f"http://{candidate}"
-
-    try:
-        parsed = urlparse.urlparse(candidate)
-    except Exception:
-        return False, "", "", None, "Endpoint Ollama remoto inválido."
-
-    if parsed.scheme not in {"http", "https"}:
-        return False, "", "", None, "Use apenas endpoints http:// ou https://."
-    if not parsed.hostname:
-        return False, "", "", None, "Endpoint Ollama remoto inválido."
-    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
-        return False, "", "", None, "Use apenas host e porta (sem path ou query)."
-
-    normalized_endpoint = f"{parsed.scheme}://{parsed.netloc}"
-    return True, "remote", normalized_endpoint, normalized_endpoint, ""
-
-
 def _normalize_config(form_like: dict[str, str]) -> tuple[bool, dict[str, str], str]:
-    """Valida os campos de configuração do formulário e devolve valores normalizados."""
+    """Valida a configuração de formulário pelo normalizador compartilhado."""
+    backend = form_like.get("backend", DEFAULT_BACKEND).strip()
+    api_base = form_like.get("api_base", "").strip()
     model = form_like.get("model", "").strip()
     batch_size = form_like.get("batch_size", "").strip()
     timeout = form_like.get("timeout", "").strip()
-    ollama_mode = form_like.get("ollama_mode", "local").strip()
-    ollama_endpoint = form_like.get("ollama_endpoint", "").strip()
-
     if not _validate_model(model):
         return False, {}, "Nome de modelo inválido."
 
@@ -183,43 +147,50 @@ def _normalize_config(form_like: dict[str, str]) -> tuple[bool, dict[str, str], 
     if timeout_num < 10:
         return False, {}, "Timeout deve ser maior ou igual a 10 segundos."
 
-    conn_ok, normalized_mode, normalized_endpoint, _, conn_error = _normalize_ollama_connection(
-        ollama_mode, ollama_endpoint
-    )
-    if not conn_ok:
-        return False, {}, conn_error
+    try:
+        endpoint = normalize_backend_endpoint(backend, api_base)
+    except BackendConfigurationError as exc:
+        return False, {}, str(exc)
 
     normalized = {
+        "backend": backend,
+        "api_base": endpoint.api_base or "",
         "model": model,
         "batch_size": str(batch_num),
         "timeout": str(timeout_num),
-        "ollama_mode": normalized_mode,
-        "ollama_endpoint": normalized_endpoint,
     }
     return True, normalized, ""
 
 
 def _load_user_config() -> dict[str, str]:
-    """Lê a configuração persistida no disco e retorna somente valores válidos."""
-    if not WEB_CONFIG_PATH.exists():
-        return {}
-    try:
-        with WEB_CONFIG_PATH.open("r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-        if not isinstance(raw, dict):
-            return {}
-        raw_config = {key: str(raw.get(key, "")).strip() for key in CONFIG_KEYS}
-        ok, normalized, _ = _normalize_config(raw_config)
-        return normalized if ok else {}
-    except Exception:
-        return {}
+    """Lê e migra a configuração persistida pelo carregador compartilhado."""
+    settings = load_backend_settings(WEB_CONFIG_PATH)
+    return _settings_to_form(settings)
 
 
 def _save_user_config(config: dict[str, str]) -> None:
-    """Salva no arquivo local os campos de configuração permitidos pela aplicação."""
-    payload = {key: config[key] for key in CONFIG_KEYS}
-    with WEB_CONFIG_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    """Persiste configuração canônica e chaves legadas de rollback."""
+    save_backend_settings(WEB_CONFIG_PATH, _settings_from_form(config))
+
+
+def _settings_from_form(config: dict[str, str]) -> BackendSettings:
+    return BackendSettings(
+        backend=config["backend"],
+        api_base=config["api_base"] or None,
+        model=config["model"],
+        batch_size=int(config["batch_size"]),
+        timeout=int(config["timeout"]),
+    )
+
+
+def _settings_to_form(settings: BackendSettings) -> dict[str, str]:
+    return {
+        "backend": settings.backend,
+        "api_base": settings.api_base or "",
+        "model": settings.model,
+        "batch_size": str(settings.batch_size),
+        "timeout": str(settings.timeout),
+    }
 
 
 def _effective_defaults() -> dict[str, str]:
@@ -575,15 +546,15 @@ def _status_payload_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_translation(cmd: list[str], ollama_host: str | None) -> None:
+def _run_translation(cmd: list[str], backend: str, api_base: str | None) -> None:
     """Executa o backend de tradução em thread separada e sincroniza estado/logs."""
     try:
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
-        if ollama_host:
-            env["OLLAMA_HOST"] = ollama_host
+        if backend == "ollama" and api_base:
+            env["OLLAMA_HOST"] = api_base
         else:
             env.pop("OLLAMA_HOST", None)
         process = subprocess.Popen(
@@ -641,6 +612,19 @@ def _build_command(form: dict[str, str]) -> list[str]:
             form["output_dir"],
             "-m",
             form["model"],
+            "--backend",
+            form.get("backend", DEFAULT_BACKEND),
+        ]
+    )
+    if form.get("api_base"):
+        cmd.extend(
+            [
+                "--api-base",
+                form["api_base"],
+            ]
+        )
+    cmd.extend(
+        [
             "--batch-size",
             form["batch_size"],
             "--timeout",
@@ -787,12 +771,18 @@ def _latest_commit_date_label() -> str:
 @app.route("/", methods=["GET"])
 def index() -> str:
     """Renderiza a página inicial com defaults efetivos e token CSRF."""
-    defaults = _effective_defaults()
+    config_error = ""
+    try:
+        defaults = _effective_defaults()
+    except BackendConfigurationError as exc:
+        defaults = dict(DEFAULT_FORM_VALUES)
+        config_error = f"Configuração salva inválida: {exc}"
     csrf_token = _generate_csrf()
     commit_date = _latest_commit_date_label()
     return render_template(
         "index.html",
         defaults=defaults,
+        config_error=config_error,
         csrf_token=csrf_token,
         commit_date=commit_date,
     )
@@ -817,11 +807,11 @@ def start_translation():
     input_dir = request.form.get("input_dir", DEFAULT_FORM_VALUES["input_dir"]).strip()
     output_dir = request.form.get("output_dir", DEFAULT_FORM_VALUES["output_dir"]).strip()
     form_settings = {
+        "backend": request.form.get("backend", DEFAULT_FORM_VALUES["backend"]),
+        "api_base": request.form.get("api_base", DEFAULT_FORM_VALUES["api_base"]),
         "model": request.form.get("model", DEFAULT_FORM_VALUES["model"]),
         "batch_size": request.form.get("batch_size", DEFAULT_FORM_VALUES["batch_size"]),
         "timeout": request.form.get("timeout", DEFAULT_FORM_VALUES["timeout"]),
-        "ollama_mode": request.form.get("ollama_mode", DEFAULT_FORM_VALUES["ollama_mode"]),
-        "ollama_endpoint": request.form.get("ollama_endpoint", DEFAULT_FORM_VALUES["ollama_endpoint"]),
     }
     config_ok, normalized_settings, config_error = _normalize_config(form_settings)
     if not config_ok:
@@ -834,25 +824,23 @@ def start_translation():
             {"ok": False, "error": "Adicione pelo menos um arquivo ASS ou SRT antes de iniciar."}
         ), 400
 
-    ollama_host = (
-        normalized_settings["ollama_endpoint"]
-        if normalized_settings["ollama_mode"] == "remote"
-        else None
-    )
-    model_available, model_error = _ensure_ollama_model_available(
-        normalized_settings["model"], ollama_host
-    )
-    if not model_available:
-        return jsonify({"ok": False, "error": model_error}), 400
+    settings = _settings_from_form(normalized_settings)
+    backend = create_backend(settings)
+    try:
+        backend.ensure_available(settings.model)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Não foi possível validar o modelo no backend {settings.backend}: {exc}"}), 400
+    finally:
+        backend.close()
 
     form = {
         "input_dir": str(safe_input),
         "output_dir": str(safe_output),
+        "backend": normalized_settings["backend"],
+        "api_base": normalized_settings["api_base"],
         "model": normalized_settings["model"],
         "batch_size": normalized_settings["batch_size"],
         "timeout": normalized_settings["timeout"],
-        "ollama_mode": normalized_settings["ollama_mode"],
-        "ollama_endpoint": normalized_settings["ollama_endpoint"],
         "turbo": request.form.get("turbo", "off"),
         "clear_cache": request.form.get("clear_cache", "off"),
         "no_cache": request.form.get("no_cache", "off"),
@@ -877,19 +865,18 @@ def start_translation():
         _state["finished_at"] = None
         _state["return_code"] = None
         sanitized_cmd = _sanitize_logs(" ".join(cmd))
-        ollama_info = (
-            "local"
-            if form["ollama_mode"] == "local"
-            else form["ollama_endpoint"]
-        )
         _state["command"] = sanitized_cmd
         _state["logs"] = [
             "[WEB] Iniciando processo...",
-            f"[WEB] Ollama: {ollama_info}",
+            f"[WEB] Backend: {form['backend']}",
             f"[WEB] Comando: {sanitized_cmd}",
         ]
 
-    worker = threading.Thread(target=_run_translation, args=(cmd, ollama_host), daemon=True)
+    worker = threading.Thread(
+        target=_run_translation,
+        args=(cmd, settings.backend, settings.api_base),
+        daemon=True,
+    )
     worker.start()
 
     return jsonify({"ok": True})
@@ -1110,11 +1097,11 @@ def save_config():
         return csrf_error
 
     incoming = {
+        "backend": request.form.get("backend", ""),
+        "api_base": request.form.get("api_base", ""),
         "model": request.form.get("model", ""),
         "batch_size": request.form.get("batch_size", ""),
         "timeout": request.form.get("timeout", ""),
-        "ollama_mode": request.form.get("ollama_mode", ""),
-        "ollama_endpoint": request.form.get("ollama_endpoint", ""),
     }
     ok, normalized, error = _normalize_config(incoming)
     if not ok:
@@ -1148,11 +1135,8 @@ def reset_config():
         return jsonify({"ok": False, "error": f"Falha ao resetar configuração: {exc}"}), 500
 
     default_config = {
-        "model": DEFAULT_FORM_VALUES["model"],
-        "batch_size": DEFAULT_FORM_VALUES["batch_size"],
-        "timeout": DEFAULT_FORM_VALUES["timeout"],
-        "ollama_mode": DEFAULT_FORM_VALUES["ollama_mode"],
-        "ollama_endpoint": DEFAULT_FORM_VALUES["ollama_endpoint"],
+        key: DEFAULT_FORM_VALUES[key]
+        for key in ("backend", "api_base", "model", "batch_size", "timeout")
     }
     return jsonify(
         {

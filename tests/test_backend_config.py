@@ -129,6 +129,24 @@ def test_save_backend_settings_keeps_canonical_and_legacy_ollama_keys(tmp_path) 
     assert saved["ollama_endpoint"] == "https://ollama.example.test:11434"
 
 
+def test_save_backend_settings_keeps_canonical_llama_swap_values_without_erasing_legacy_keys(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    settings = BackendSettings(
+        backend="llama-swap",
+        api_base="http://127.0.0.1:9292",
+        model="Qwen3.6-28B-REAP20-A3B-Q4_K_M",
+    )
+
+    save_backend_settings(path, settings)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["backend"] == "llama-swap"
+    assert saved["api_base"] == "http://127.0.0.1:9292/v1"
+    assert saved["model"] == "Qwen3.6-28B-REAP20-A3B-Q4_K_M"
+    assert saved["ollama_mode"] == "local"
+    assert saved["ollama_endpoint"] == ""
+
+
 def test_factory_constructs_only_the_selected_ollama_backend() -> None:
     class FakeOllamaClient:
         pass
