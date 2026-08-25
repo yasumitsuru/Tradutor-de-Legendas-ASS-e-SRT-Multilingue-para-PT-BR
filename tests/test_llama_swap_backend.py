@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 import pytest
@@ -88,12 +88,22 @@ def test_health_normalizes_http_errors_without_exposing_response_data(status: in
     assert opener.paths == ["/health"]
 
 
-def test_list_models_returns_only_valid_advertised_model_ids() -> None:
-    opener = FakeOpener(FakeResponse({"data": [{"id": "qwen3.6:latest"}, {"id": 42}, {"name": "ignored"}]}))
+def test_list_models_returns_advertised_model_ids() -> None:
+    opener = FakeOpener(FakeResponse({"data": [{"id": "qwen3.6:latest"}]}))
 
     models = LlamaSwapBackend("http://127.0.0.1:9292/v1", opener=opener).list_models()
 
     assert models == (type(models[0])(model="qwen3.6:latest", backend="llama-swap"),)
+    assert opener.paths == ["/v1/models"]
+
+
+@pytest.mark.parametrize("body", ({"data": [{"id": 42}]}, {"data": [{"name": "qwen3.6:latest"}]}, {"data": ["qwen3.6:latest"]}))
+def test_list_models_rejects_entries_without_a_string_id(body: object) -> None:
+    opener = FakeOpener(FakeResponse(body))
+
+    with pytest.raises(BackendResponseError):
+        LlamaSwapBackend("http://127.0.0.1:9292/v1", opener=opener).list_models()
+
     assert opener.paths == ["/v1/models"]
 
 
@@ -198,7 +208,13 @@ def test_generate_normalizes_http_errors_in_one_attempt(status: int) -> None:
 
 @pytest.mark.parametrize(
     ("failure", "error_type"),
-    ((TimeoutError("late"), BackendTimeoutError), (socket.timeout("late"), BackendTimeoutError), (OSError("offline"), BackendTransportError)),
+    (
+        (TimeoutError("late"), BackendTimeoutError),
+        (socket.timeout("late"), BackendTimeoutError),
+        (OSError("offline"), BackendTransportError),
+        (URLError(socket.timeout("late")), BackendTimeoutError),
+        (URLError(OSError("offline")), BackendTransportError),
+    ),
 )
 def test_generate_normalizes_timeout_and_connection_errors_without_retry(failure: Exception, error_type: type[Exception]) -> None:
     opener = FakeOpener(failure)

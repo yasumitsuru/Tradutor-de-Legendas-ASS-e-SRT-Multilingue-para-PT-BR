@@ -40,11 +40,12 @@ class LlamaSwapBackend:
         payload = self._get_json(f"{self.api_base}/models")
         if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
             raise BackendResponseError("llama-swap retornou uma lista de modelos inválida.")
-        return tuple(
-            ModelInfo(model=item["id"], backend=self.backend_id)
-            for item in payload["data"]
-            if isinstance(item, Mapping) and isinstance(item.get("id"), str)
-        )
+        models: list[ModelInfo] = []
+        for item in payload["data"]:
+            if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
+                raise BackendResponseError("llama-swap retornou uma lista de modelos inválida.")
+            models.append(ModelInfo(model=item["id"], backend=self.backend_id))
+        return tuple(models)
 
     def ensure_available(self, model: str) -> None:
         self.health()
